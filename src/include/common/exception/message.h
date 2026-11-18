@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace lbug {
 namespace common {
@@ -25,6 +26,8 @@ struct ExceptionMessage {
     static std::string variableNotInScope(const std::string& varName);
     static std::string listFunctionIncompatibleChildrenType(const std::string& functionName,
         const std::string& leftType, const std::string& rightType);
+    // External access.
+    static std::string externalAccessDisabled(std::string_view operation);
     // Skip limit exception
     static std::string invalidSkipLimitParam(const std::string& exprName,
         const std::string& skipOrLimit);

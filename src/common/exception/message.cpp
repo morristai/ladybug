@@ -61,6 +61,10 @@ std::string ExceptionMessage::listFunctionIncompatibleChildrenType(const std::st
                        " and " + rightType + ".");
 }
 
+std::string ExceptionMessage::externalAccessDisabled(std::string_view operation) {
+    return std::format("External access is disabled for this connection: {}.", operation);
+}
+
 std::string ExceptionMessage::invalidSkipLimitParam(const std::string& exprName,
     const std::string& skipOrLimit) {
     return std::format("Cannot evaluate {} as a valid {} number.", exprName, skipOrLimit);

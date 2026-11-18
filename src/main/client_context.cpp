@@ -416,12 +416,14 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
     const bool planStale =
         cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion() ||
         cachedStatement->hasUncommittedCatalogChanges ||
-        (activeTransaction != nullptr && activeTransaction->hasCatalogChanges());
+        (activeTransaction != nullptr && activeTransaction->hasCatalogChanges()) ||
+        cachedStatement->boundWithExternalAccessDisabled != clientConfig.disableExternalAccess;
     // Statements with parameters baked into a plan (e.g. parameter-valued SKIP/LIMIT
     // frozen to uint64_t) must rebind/replan on every execution instead of reusing any
     // cached plan (https://github.com/LadybugDB/ladybug/issues/985).
     // Likewise, a catalog change (e.g. ALTER TABLE ADD) or a checkpoint that renumbered column
     // IDs invalidates the bound logical plan (https://github.com/LadybugDB/ladybug/issues/1158).
+    // A plan bound before disable_external_access was enabled has not been checked against it.
     if (useCachedPlan && !cachedStatement->hasBakedParameters && !planStale) {
         return executeNoLock(preparedStatement, cachedStatement, queryID, {}, true);
     }
@@ -447,6 +449,8 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
         cachedStatement->planVersion = newCachedStatement->planVersion;
         cachedStatement->hasUncommittedCatalogChanges =
             newCachedStatement->hasUncommittedCatalogChanges;
+        cachedStatement->boundWithExternalAccessDisabled =
+            newCachedStatement->boundWithExternalAccessDisabled;
         cachedStatement->physicalPlanCache.reset();
         cachedStatement->sinkResultSetDescriptors.clear();
         // The pool holds operator trees cloned from the previous template (bound for the
@@ -631,6 +635,7 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
         preparedStatement->errMsg = exception.what();
     }
     cachedStatement->planVersion = localDatabase->getCatalog()->getPlanVersion();
+    cachedStatement->boundWithExternalAccessDisabled = clientConfig.disableExternalAccess;
     prepareTimer.stop();
     preparedStatement->preparedSummary.compilingTime =
         parsedStatement->getParsingTime() + prepareTimer.getElapsedTimeMS();

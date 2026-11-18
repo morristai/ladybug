@@ -77,6 +77,9 @@ struct CachedPreparedStatement {
     // Catalog versions advance at commit. A plan bound after transaction-local DDL (including
     // dynamic LIST partition creation) must also be rebound after later writes or rollback.
     bool hasUncommittedCatalogChanges = false;
+    // ClientConfig::disableExternalAccess when the statement was bound. The binder enforces
+    // that setting, so a statement bound before it was enabled must be rebound to be checked.
+    bool boundWithExternalAccessDisabled = false;
 
     // Pool of cloned physical plans ready for reuse, keyed by executing thread.
     // Cloning the cached template per execution costs hundreds of small allocations

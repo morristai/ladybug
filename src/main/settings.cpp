@@ -360,6 +360,23 @@ common::Value EnableSubNodeGroupMorselsSetting::getSetting(const ClientContext* 
         context->getClientConfig()->subNodeGroupMorselScope));
 }
 
+void DisableExternalAccessSetting::setContext(ClientContext* context,
+    const common::Value& parameter) {
+    parameter.validateType(inputType);
+    const auto disable = parameter.getValue<bool>();
+    auto* clientConfig = context->getClientConfigUnsafe();
+    if (clientConfig->disableExternalAccess && !disable) {
+        throw common::RuntimeException(
+            "disable_external_access cannot be set back to false once it has been enabled for a "
+            "connection.");
+    }
+    clientConfig->disableExternalAccess = disable;
+}
+
+common::Value DisableExternalAccessSetting::getSetting(const ClientContext* context) {
+    return common::Value(context->getClientConfig()->disableExternalAccess);
+}
+
 void PhysicalPlanPoolPerThreadSetting::setContext(ClientContext* context,
     const common::Value& parameter) {
     parameter.validateType(inputType);

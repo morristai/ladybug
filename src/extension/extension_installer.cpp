@@ -4,6 +4,8 @@
 #include <thread>
 
 #include "common/exception/io.h"
+#include "common/exception/message.h"
+#include "common/exception/runtime.h"
 #include "common/file_system/virtual_file_system.h"
 #include "httplib.h"
 #include "main/client_context.h"
@@ -98,6 +100,11 @@ void ExtensionInstaller::tryDownloadExtensionFile(const ExtensionRepoInfo& repoI
 }
 
 bool ExtensionInstaller::install() {
+    // The binder refuses the statement first; this also covers callers that do not go through it.
+    if (context.getClientConfig()->disableExternalAccess) {
+        throw common::RuntimeException(
+            common::ExceptionMessage::externalAccessDisabled("installing an extension"));
+    }
     auto install = installExtension();
     if (install) {
         installDependencies();

@@ -322,6 +322,10 @@ public:
     std::vector<PropertyDefinition> bindRelPropertyDefinitions(const parser::CreateTableInfo& info);
 
     /*** validations ***/
+    // Throws if the connection has disable_external_access set. Called before a statement is
+    // allowed to name a file, another database or an extension; `operation` names what was
+    // refused.
+    void validateExternalAccess(std::string_view operation) const;
     LBUG_API static void validateTableExistence(const main::ClientContext& context,
         const std::string& tableName);
     LBUG_API static void validateNodeTableType(const catalog::TableCatalogEntry* entry);

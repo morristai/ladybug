@@ -166,6 +166,14 @@ struct EnablePackedPathExtendSetting {
     static common::Value getSetting(const ClientContext* context);
 };
 
+struct DisableExternalAccessSetting {
+    static constexpr auto name = "disable_external_access";
+    static constexpr auto inputType = common::LogicalTypeID::BOOL;
+    // One-way: once true for a connection, setting it to false throws a RuntimeException.
+    static void setContext(ClientContext* context, const common::Value& parameter);
+    static common::Value getSetting(const ClientContext* context);
+};
+
 struct EnableCachedPreparedStatementSetting {
     static constexpr auto name = "enable_cached_prepared_statement";
     static constexpr auto inputType = common::LogicalTypeID::STRING;

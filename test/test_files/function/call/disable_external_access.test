@@ -1,0 +1,294 @@
+-DATASET CSV demo-db/csv
+
+--
+
+-CASE SettingIsOneWay
+-STATEMENT CALL current_setting('disable_external_access') RETURN *
+---- 1
+False
+-STATEMENT CALL disable_external_access=false
+---- ok
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT CALL current_setting('disable_external_access') RETURN *
+---- 1
+True
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT CALL disable_external_access=false
+---- error
+Runtime exception: disable_external_access cannot be set back to false once it has been enabled for a connection.
+-STATEMENT CALL current_setting('disable_external_access') RETURN *
+---- 1
+True
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN count(*)
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+
+-CASE QueriesOverTheDatabaseStillWork
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT MATCH (a:User)-[e:Follows]->(b:User) RETURN a.name, e.since, b.name
+---- 4
+Adam|2020|Karissa
+Adam|2020|Zhang
+Karissa|2021|Zhang
+Zhang|2022|Noura
+-STATEMENT MATCH p=(a:User)-[e:Follows* WSHORTEST(since)]->(b:User)
+           WHERE a.name='Adam'
+           RETURN properties(nodes(p), 'name'), cost(e)
+---- 3
+[Adam,Karissa]|2020.000000
+[Adam,Zhang,Noura]|4042.000000
+[Adam,Zhang]|2020.000000
+-STATEMENT MATCH (a:User)-[e:Follows* SHORTEST 1..3]->(b:User) WHERE a.name='Adam' RETURN b.name, length(e)
+---- 3
+Karissa|1
+Noura|2
+Zhang|1
+-STATEMENT UNWIND [1, 2, 3] AS x RETURN sum(x)
+---- 1
+6
+-STATEMENT EXPLAIN MATCH (a:User) RETURN a.name
+---- ok
+-STATEMENT CALL show_tables() RETURN name
+---- 4
+City
+Follows
+LivesIn
+User
+-STATEMENT CALL PROJECT_GRAPH('G', ['User'], ['Follows'])
+---- ok
+-STATEMENT CALL threads=2
+---- ok
+-LOG A query source is not external: it reads the database's own tables
+-STATEMENT CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY (name))
+---- ok
+-STATEMENT COPY Person FROM (MATCH (a:User) RETURN a.name, a.age)
+---- ok
+-STATEMENT CREATE NODE TABLE Elder AS MATCH (a:User) WHERE a.age > 35 RETURN a.name, a.age
+---- ok
+-STATEMENT MATCH (p:Person), (e:Elder) RETURN count(DISTINCT p), count(DISTINCT e)
+---- 1
+4|2
+
+-CASE FileScansAreRefused
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM ['${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv', '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/city.csv'] RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM glob('${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/*.csv') RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD WITH HEADERS (name STRING, age INT64) FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' (file_format='csv') WHERE age > 30 RETURN name
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/parquet/user.parquet' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/npy-1d/one_dim_int64.npy' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-LOG The refusal does not depend on the file, so it cannot be used to probe which files exist
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/no-such-file.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM 'https://example.com/user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-LOG A file scan anywhere in a query is refused
+-STATEMENT MATCH (a:User) WITH a LIMIT 1 LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN count(*)
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT MATCH (a:User) RETURN a.name UNION ALL LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN column0
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT EXPLAIN LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT CALL PROJECT_GRAPH_CYPHER('G', "LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *")
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT COPY User FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv'
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT COPY User FROM (LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *)
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT CREATE NODE TABLE Loaded AS LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT CREATE NODE TABLE npytable (id INT64, PRIMARY KEY(id))
+---- ok
+-STATEMENT COPY npytable FROM ('${LBUG_ROOT_DIRECTORY}/dataset/npy-1d/one_dim_int64.npy') BY COLUMN
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-LOG The path settings stay settable but do not bring file scans back
+-STATEMENT CALL home_directory='${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv'
+---- ok
+-STATEMENT CALL file_search_path='${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv'
+---- ok
+-STATEMENT LOAD FROM 'user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT LOAD FROM '~/user.csv' RETURN *
+---- error
+Binder exception: External access is disabled for this connection: scanning files.
+-STATEMENT MATCH (a:User) RETURN count(*)
+---- 1
+4
+
+-CASE FileWritesAreRefused
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT COPY (MATCH (u:User) RETURN u.*) TO '${DATABASE_PATH}/refused_user.csv' (header=true)
+---- error
+Binder exception: External access is disabled for this connection: COPY TO.
+-STATEMENT COPY (MATCH (u:User) RETURN u.*) TO '${DATABASE_PATH}/refused_user.parquet'
+---- error
+Binder exception: External access is disabled for this connection: COPY TO.
+-STATEMENT EXPLAIN COPY (MATCH (u:User) RETURN u.*) TO '${DATABASE_PATH}/refused_user.csv'
+---- error
+Binder exception: External access is disabled for this connection: COPY TO.
+-STATEMENT EXPORT DATABASE '${DATABASE_PATH}/refused_export'
+---- error
+Binder exception: External access is disabled for this connection: EXPORT DATABASE.
+-STATEMENT IMPORT DATABASE '${DATABASE_PATH}/refused_export'
+---- error
+Binder exception: External access is disabled for this connection: IMPORT DATABASE.
+
+-CASE OtherDatabasesAreRefused
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT ATTACH '${DATABASE_PATH}/other.lbdb' AS other (DBTYPE lbug)
+---- error
+Binder exception: External access is disabled for this connection: ATTACH.
+-STATEMENT DETACH other
+---- error
+Binder exception: External access is disabled for this connection: DETACH.
+-STATEMENT USE other
+---- error
+Binder exception: External access is disabled for this connection: USE.
+-STATEMENT CREATE NODE TABLE Ext(id INT32, name STRING, population INT64, PRIMARY KEY(id)) WITH (storage = '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/icebug-disk', format = 'icebug-disk')
+---- error
+Binder exception: External access is disabled for this connection: CREATE TABLE with the storage option.
+-STATEMENT CREATE REL TABLE ExtRel(FROM User TO User, since INT32) WITH (storage = 'other.follows')
+---- error
+Binder exception: External access is disabled for this connection: CREATE TABLE with the storage option.
+-LOG The graphs of the database itself are not external
+-STATEMENT CREATE GRAPH g2
+---- ok
+-STATEMENT USE GRAPH g2
+---- ok
+-STATEMENT USE GRAPH main
+---- ok
+
+-CASE ExtensionsAreRefused
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT INSTALL httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT FORCE INSTALL httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT INSTALL httpfs FROM 'http://localhost:1/'
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT UPDATE httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT UNINSTALL httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT LOAD EXTENSION httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT LOAD httpfs
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT LOAD EXTENSION '${LBUG_ROOT_DIRECTORY}/dataset/libunknown.lbug_extension'
+---- error
+Binder exception: External access is disabled for this connection: INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION.
+-STATEMENT CALL show_loaded_extensions() RETURN count(*)
+---- 1
+0
+
+-CASE SameStatementsWithTheSettingOff
+-LOG The default is off, and setting it to false explicitly keeps it off
+-STATEMENT CALL disable_external_access=false
+---- ok
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/user.csv' RETURN *
+---- 4
+Adam|30
+Karissa|40
+Zhang|50
+Noura|25
+-STATEMENT LOAD FROM glob('${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/use*.csv') RETURN count(*)
+---- 1
+4
+-STATEMENT LOAD FROM '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/no-such-file.csv' RETURN *
+---- error
+Binder exception: No file found that matches the pattern: ${LBUG_ROOT_DIRECTORY}/dataset/demo-db/csv/no-such-file.csv.
+-STATEMENT COPY (MATCH (u:User) RETURN u.*) TO '${DATABASE_PATH}/user.csv' (header=true)
+---- ok
+-STATEMENT LOAD FROM '${DATABASE_PATH}/user.csv' (header=true) RETURN count(*)
+---- 1
+4
+-STATEMENT CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY (name))
+---- ok
+-STATEMENT COPY Person FROM '${DATABASE_PATH}/user.csv' (header=true)
+---- ok
+-STATEMENT MATCH (p:Person) RETURN count(*)
+---- 1
+4
+-STATEMENT EXPORT DATABASE '${DATABASE_PATH}/allowed_export'
+---- ok
+-STATEMENT DROP TABLE LivesIn
+---- ok
+-STATEMENT DROP TABLE City
+---- ok
+-STATEMENT CREATE NODE TABLE city(id INT32, name STRING, population INT64, PRIMARY KEY(id)) WITH (storage = '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/icebug-disk', format = 'icebug-disk')
+---- ok
+-STATEMENT MATCH (c:city) RETURN count(*)
+---- 1
+3
+-LOG The statements below fail for their own reasons, not because external access is refused
+-STATEMENT ATTACH '${DATABASE_PATH}/no-such-db.lbdb' AS other (DBTYPE lbug)
+---- error(regex)
+^(?!.*External access is disabled).*$
+-STATEMENT DETACH other
+---- error(regex)
+^(?!.*External access is disabled).*$
+-STATEMENT USE other
+---- error
+Runtime exception: No database named other.
+-STATEMENT INSTALL sqlitescanner
+---- error
+Binder exception: sqlitescanner is not an official extension.
+Non-official extensions can be installed directly by: `LOAD EXTENSION [EXTENSION_PATH]`.
+-STATEMENT UNINSTALL sqlitescanner
+---- error
+Binder exception: The extension sqlitescanner is not an official extension.
+Only official extensions can be uninstalled.
+-STATEMENT LOAD EXTENSION '${LBUG_ROOT_DIRECTORY}/dataset/libunknown.lbug_extension'
+---- error
+Binder exception: The extension ${LBUG_ROOT_DIRECTORY}/dataset/libunknown.lbug_extension is neither an official extension, nor does the extension path: '${LBUG_ROOT_DIRECTORY}/dataset/libunknown.lbug_extension' exist.
+
+-CASE TablesStoredOutsideTheDatabaseFileStayReadable
+-LOG The storage of an existing table comes from the catalog, not from the statement
+-STATEMENT DROP TABLE LivesIn
+---- ok
+-STATEMENT DROP TABLE City
+---- ok
+-STATEMENT CREATE NODE TABLE city(id INT32, name STRING, population INT64, PRIMARY KEY(id)) WITH (storage = '${LBUG_ROOT_DIRECTORY}/dataset/demo-db/icebug-disk', format = 'icebug-disk')
+---- ok
+-STATEMENT CALL disable_external_access=true
+---- ok
+-STATEMENT MATCH (c:city) RETURN count(*)
+---- 1
+3

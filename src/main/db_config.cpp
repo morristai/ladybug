@@ -26,6 +26,7 @@ static ConfigurationOption options[] = { // NOLINT(cert-err58-cpp):
     GET_CONFIGURATION(PKValidatorSpillThresholdSetting), GET_CONFIGURATION(EnableOptimizerSetting),
     GET_CONFIGURATION(EnableInternalCatalogSetting),
     GET_CONFIGURATION(EnablePackedPathExtendSetting),
+    GET_CONFIGURATION(DisableExternalAccessSetting),
     GET_CONFIGURATION(EnableCachedPreparedStatementSetting),
     GET_CONFIGURATION(EnableSubNodeGroupMorselsSetting),
     GET_CONFIGURATION(PhysicalPlanPoolPerThreadSetting)};

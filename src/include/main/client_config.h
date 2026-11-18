@@ -60,6 +60,7 @@ struct ClientConfigDefault {
     static constexpr bool ENABLE_PLAN_OPTIMIZER = true;
     static constexpr bool ENABLE_INTERNAL_CATALOG = false;
     static constexpr bool ENABLE_PACKED_PATH_EXTEND = false;
+    static constexpr bool DISABLE_EXTERNAL_ACCESS = false;
     // Statement kinds for which the cached-physical-plan fast path is enabled.
     // BOTH preserves the historical behaviour (all parameterized statements).
     static constexpr CachedPreparedStatementScope CACHED_PREPARED_STATEMENT_SCOPE =
@@ -110,6 +111,11 @@ struct ClientConfig {
     bool enableInternalCatalog = ClientConfigDefault::ENABLE_INTERNAL_CATALOG;
     // If planning packed sibling path extensions.
     bool enablePackedPathExtend = ClientConfigDefault::ENABLE_PACKED_PATH_EXTEND;
+    // If statements on this connection are refused access to anything outside the database:
+    // files named by a statement (LOAD FROM, COPY FROM/TO, EXPORT/IMPORT DATABASE, external
+    // table storage), other databases (ATTACH/DETACH/USE) and extensions. One-way: it cannot be
+    // set back to false, so a statement cannot lift the restriction of the connection it runs on.
+    bool disableExternalAccess = ClientConfigDefault::DISABLE_EXTERNAL_ACCESS;
     // Memory budget (bytes) for the no-hash-index COPY primary-key validator before it spills
     // sorted runs to disk. See ClientConfigDefault::PK_VALIDATOR_SPILL_THRESHOLD.
     uint64_t pkValidatorSpillThreshold = ClientConfigDefault::PK_VALIDATOR_SPILL_THRESHOLD;

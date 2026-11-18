@@ -4,9 +4,11 @@
 #include "catalog/catalog.h"
 #include "common/copier_config/csv_reader_config.h"
 #include "common/exception/binder.h"
+#include "common/exception/message.h"
 #include "common/string_utils.h"
 #include "function/built_in_function_utils.h"
 #include "function/table/table_function.h"
+#include "main/client_context.h"
 #include "parser/statement.h"
 #include "processor/operator/persistent/reader/csv/parallel_csv_reader.h"
 #include "processor/operator/persistent/reader/csv/serial_csv_reader.h"
@@ -43,6 +45,7 @@ std::unique_ptr<BoundStatement> Binder::bind(const Statement& statement) {
         boundStatement = bindCopyFromClause(statement);
     } break;
     case StatementType::COPY_TO: {
+        validateExternalAccess("COPY TO");
         boundStatement = bindCopyToClause(statement);
     } break;
     case StatementType::DROP: {
@@ -73,21 +76,27 @@ std::unique_ptr<BoundStatement> Binder::bind(const Statement& statement) {
         boundStatement = bindTransaction(statement);
     } break;
     case StatementType::EXTENSION: {
+        validateExternalAccess("INSTALL, UPDATE, UNINSTALL and LOAD EXTENSION");
         boundStatement = bindExtension(statement);
     } break;
     case StatementType::EXPORT_DATABASE: {
+        validateExternalAccess("EXPORT DATABASE");
         boundStatement = bindExportDatabaseClause(statement);
     } break;
     case StatementType::IMPORT_DATABASE: {
+        validateExternalAccess("IMPORT DATABASE");
         boundStatement = bindImportDatabaseClause(statement);
     } break;
     case StatementType::ATTACH_DATABASE: {
+        validateExternalAccess("ATTACH");
         boundStatement = bindAttachDatabase(statement);
     } break;
     case StatementType::DETACH_DATABASE: {
+        validateExternalAccess("DETACH");
         boundStatement = bindDetachDatabase(statement);
     } break;
     case StatementType::USE_DATABASE: {
+        validateExternalAccess("USE");
         boundStatement = bindUseDatabase(statement);
     } break;
     case StatementType::CREATE_GRAPH: {
@@ -105,6 +114,12 @@ std::unique_ptr<BoundStatement> Binder::bind(const Statement& statement) {
     }
     BoundStatementRewriter::rewrite(*boundStatement, *clientContext);
     return boundStatement;
+}
+
+void Binder::validateExternalAccess(std::string_view operation) const {
+    if (clientContext->getClientConfig()->disableExternalAccess) {
+        throw BinderException(ExceptionMessage::externalAccessDisabled(operation));
+    }
 }
 
 std::shared_ptr<Expression> Binder::bindWhereExpression(const ParsedExpression& parsedExpression) {

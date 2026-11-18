@@ -11,6 +11,7 @@ add_lbug_api_test(api_test
         arrow_error_scenarios_test.cpp
         arrow_drop_table_test.cpp
         drop_index_test.cpp
+        external_access_test.cpp
         arrow_table_function_test.cpp
         prepare_test.cpp
         project_graph_csr_test.cpp

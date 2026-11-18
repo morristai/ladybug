@@ -1,5 +1,7 @@
 #include "extension/extension_manager.h"
 
+#include "common/exception/message.h"
+#include "common/exception/runtime.h"
 #include "common/file_system/virtual_file_system.h"
 #include "common/string_utils.h"
 #include "extension/extension.h"
@@ -20,6 +22,11 @@ static void executeExtensionLoader(main::ClientContext* context, const std::stri
 }
 
 void ExtensionManager::loadExtension(const std::string& path, main::ClientContext* context) {
+    // The binder refuses the statement first; this also covers callers that do not go through it.
+    if (context->getClientConfig()->disableExternalAccess) {
+        throw common::RuntimeException(
+            common::ExceptionMessage::externalAccessDisabled("loading an extension"));
+    }
     auto fullPath = path;
     bool isOfficial = ExtensionUtils::isOfficialExtension(path);
     if (isOfficial) {

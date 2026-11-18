@@ -190,8 +190,10 @@ void Binder::validateColumnExistence(const TableCatalogEntry* entry,
     }
 }
 
-static std::string getStorage(const case_insensitive_map_t<Value>& options) {
+// The storage option names files or an attached database's table that back the new table.
+static std::string getStorage(const Binder& binder, const case_insensitive_map_t<Value>& options) {
     if (options.contains(TableOptionConstants::REL_STORAGE_OPTION)) {
+        binder.validateExternalAccess("CREATE TABLE with the storage option");
         return options.at(TableOptionConstants::REL_STORAGE_OPTION).toString();
     }
     return "";
@@ -256,7 +258,7 @@ BoundCreateTableInfo Binder::bindCreateNodeTableInfo(const CreateTableInfo* info
     auto& extraInfo = info->extraInfo->constCast<ExtraCreateNodeTableInfo>();
     validatePrimaryKey(extraInfo.pKName, propertyDefinitions);
     auto boundOptions = bindParsingOptions(extraInfo.options);
-    auto storage = getStorage(boundOptions);
+    auto storage = getStorage(*this, boundOptions);
     auto parsedFormat = getStorageFormat(boundOptions);
     auto storageFormat = parsedFormat.format;
     auto storageFormatName = std::move(parsedFormat.externalName);
@@ -318,7 +320,7 @@ BoundCreateTableInfo Binder::bindCreateRelTableGroupInfo(const CreateTableInfo* 
     auto dstMultiplicity = RelMultiplicityUtils::getBwd(extraInfo.relMultiplicity);
     auto boundOptions = bindParsingOptions(extraInfo.options);
     auto storageDirection = getStorageDirection(boundOptions);
-    auto storage = getStorage(boundOptions);
+    auto storage = getStorage(*this, boundOptions);
     auto parsedFormat = getStorageFormat(boundOptions);
     auto storageFormat = parsedFormat.format;
     auto storageFormatName = std::move(parsedFormat.externalName);
