@@ -300,7 +300,7 @@ static void bindColumns(const FileScanInfo& fileScanInfo, std::vector<std::strin
 
 static std::unique_ptr<TableFuncBindData> bindFunc(main::ClientContext* context,
     const TableFuncBindInput* input) {
-    auto scanInput = dynamic_cast_checked<ExtraScanTableFuncBindInput*>(input->extraInput.get());
+    auto scanInput = input->getScanInput();
     if (scanInput->fileScanInfo.options.size() > 1 ||
         (scanInput->fileScanInfo.options.size() == 1 &&
             !scanInput->fileScanInfo.options.contains(CopyConstants::IGNORE_ERRORS_OPTION_NAME))) {

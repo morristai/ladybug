@@ -184,7 +184,7 @@ void SerialCSVScan::bindColumns(const ExtraScanTableFuncBindInput* bindInput,
 
 static std::unique_ptr<TableFuncBindData> bindFunc(main::ClientContext* context,
     const TableFuncBindInput* input) {
-    auto scanInput = dynamic_cast_checked<ExtraScanTableFuncBindInput*>(input->extraInput.get());
+    auto scanInput = input->getScanInput();
     if (scanInput->expectedColumnTypes.size() > 0) {
         scanInput->fileScanInfo.options.insert_or_assign("SAMPLE_SIZE",
             Value((int64_t)0)); // only scan headers

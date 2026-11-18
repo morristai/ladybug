@@ -299,7 +299,7 @@ static offset_t tableFunc(const TableFuncInput& input, TableFuncOutput& output) 
 
 static std::unique_ptr<TableFuncBindData> bindFunc(main::ClientContext* context,
     const TableFuncBindInput* input) {
-    auto scanInput = dynamic_cast_checked<ExtraScanTableFuncBindInput*>(input->extraInput.get());
+    auto scanInput = input->getScanInput();
     bool detectedHeader = false;
 
     DialectOption detectedDialect;

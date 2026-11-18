@@ -2,6 +2,7 @@
 
 #include "binder/expression/expression_util.h"
 #include "binder/expression/literal_expression.h"
+#include "common/exception/binder.h"
 
 namespace lbug {
 namespace function {
@@ -18,6 +19,15 @@ common::Value TableFuncBindInput::getValue(common::idx_t idx) const {
 template<typename T>
 T TableFuncBindInput::getLiteralVal(common::idx_t idx) const {
     return getValue(idx).getValue<T>();
+}
+
+ExtraScanTableFuncBindInput* TableFuncBindInput::getScanInput() const {
+    auto scanInput = dynamic_cast<ExtraScanTableFuncBindInput*>(extraInput.get());
+    if (scanInput == nullptr) {
+        throw common::BinderException("File scan functions cannot be called directly. Scan the "
+                                      "file with LOAD FROM or COPY FROM instead.");
+    }
+    return scanInput;
 }
 
 template LBUG_API std::string TableFuncBindInput::getLiteralVal<std::string>(

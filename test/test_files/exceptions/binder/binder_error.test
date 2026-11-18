@@ -669,3 +669,20 @@ Binder exception: Cannot order by a.audience. Order by MAP(STRING, INT64) is not
 -STATEMENT MATCH (a:movies) RETURN a ORDER BY a.grade;
 ---- error
 Binder exception: Cannot order by a.grade. Order by UNION(credit BOOL, grade1 DOUBLE, grade2 INT64) is not supported.
+
+-CASE CallFileScanFunctionDirectly
+-STATEMENT CALL READ_CSV_SERIAL('${LBUG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv') RETURN *
+---- error
+Binder exception: File scan functions cannot be called directly. Scan the file with LOAD FROM or COPY FROM instead.
+-STATEMENT CALL READ_CSV_PARALLEL('${LBUG_ROOT_DIRECTORY}/dataset/tinysnb/vPerson.csv') RETURN *
+---- error
+Binder exception: File scan functions cannot be called directly. Scan the file with LOAD FROM or COPY FROM instead.
+-STATEMENT CALL READ_PARQUET('${LBUG_ROOT_DIRECTORY}/dataset/demo-db/parquet/user.parquet') RETURN *
+---- error
+Binder exception: File scan functions cannot be called directly. Scan the file with LOAD FROM or COPY FROM instead.
+-STATEMENT CALL READ_NPY('${LBUG_ROOT_DIRECTORY}/dataset/npy-1d/one_dim_int64.npy') RETURN *
+---- error
+Binder exception: File scan functions cannot be called directly. Scan the file with LOAD FROM or COPY FROM instead.
+-STATEMENT MATCH (a:person) CALL READ_PARQUET('${LBUG_ROOT_DIRECTORY}/dataset/demo-db/parquet/user.parquet') RETURN count(*)
+---- error
+Binder exception: File scan functions cannot be called directly. Scan the file with LOAD FROM or COPY FROM instead.

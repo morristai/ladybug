@@ -717,7 +717,7 @@ static row_idx_t getNumRows(std::vector<std::string> filePaths, uint64_t numColu
 
 static std::unique_ptr<TableFuncBindData> bindFunc(main::ClientContext* context,
     const TableFuncBindInput* input) {
-    auto scanInput = dynamic_cast_checked<ExtraScanTableFuncBindInput*>(input->extraInput.get());
+    auto scanInput = input->getScanInput();
     const auto& options = scanInput->fileScanInfo.options;
     // The user-facing COPY options are `IGNORE_ERRORS=true` and `IGNORE_ERRORS=true
     // (DUPLICATE_PK_ONLY)`; the parser rewrites the latter into the internal SKIP_DUPLICATE_PK

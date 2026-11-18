@@ -26,6 +26,7 @@ namespace function {
 using optional_params_t = common::case_insensitive_map_t<common::Value>;
 
 struct TableFunction;
+struct ExtraScanTableFuncBindInput;
 
 struct ExtraTableFuncBindInput {
     virtual ~ExtraTableFuncBindInput() = default;
@@ -52,6 +53,9 @@ struct LBUG_API TableFuncBindInput {
     common::Value getValue(common::idx_t idx) const;
     template<typename T>
     T getLiteralVal(common::idx_t idx) const;
+    // The input a file scan source binds its scan function with. A scan function that is called
+    // directly (e.g. CALL READ_PARQUET('f') RETURN *) has none: throws a BinderException.
+    ExtraScanTableFuncBindInput* getScanInput() const;
 };
 
 struct LBUG_API ExtraScanTableFuncBindInput : ExtraTableFuncBindInput {
