@@ -22,6 +22,7 @@ public:
     StringChunkData(MemoryManager& mm, common::LogicalType dataType, bool enableCompression,
         const ColumnChunkMetadata& metadata);
     void resetToEmpty() override;
+    void resetToAllNull() override;
 
     void append(common::ValueVector* vector, const common::SelectionView& selView) override;
     void append(const ColumnChunkData* other, common::offset_t startPosInOtherChunk,
@@ -85,6 +86,8 @@ private:
         common::offset_t startPosInOtherChunk, uint32_t numValuesToAppend);
 
     void setValueFromString(std::string_view value, uint64_t pos);
+
+    void markOverwrite(common::offset_t offsetInChunk);
 
     void updateNumValues(size_t newValue);
 

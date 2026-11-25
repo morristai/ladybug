@@ -65,6 +65,24 @@ void StringChunkData::resizeWithoutPreserve(uint64_t newCapacity) {
     indexColumnChunk->resizeWithoutPreserve(newCapacity);
 }
 
+void StringChunkData::resetToAllNull() {
+    ColumnChunkData::resetToAllNull();
+    // The dictionary keeps the strings of the rows that were just nulled out.
+    if (dictionaryChunk->getOffsetChunk()->getNumValues() > 0) {
+        needFinalize = true;
+    }
+}
+
+void StringChunkData::markOverwrite(offset_t offsetInChunk) {
+    // Only replacing a non-null row can leave an unreferenced dictionary entry. Filling a null
+    // row below numValues does not: rel COPY scatters each node group's rows into a chunk reset
+    // to all-null in CSR order, and pruning there rebuilt every dictionary for nothing.
+    if (!needFinalize && offsetInChunk < numValues && !nullData->isNull(offsetInChunk))
+        [[unlikely]] {
+        needFinalize = true;
+    }
+}
+
 void StringChunkData::resetToEmpty() {
     ColumnChunkData::resetToEmpty();
     indexColumnChunk->resetToEmpty();
@@ -152,9 +170,7 @@ void StringChunkData::write(const ValueVector* vector, offset_t offsetInVector,
     offset_t offsetInChunk) {
     DASSERT(vector->dataType.getPhysicalType() == PhysicalTypeID::STRING ||
             vector->dataType.getPhysicalType() == PhysicalTypeID::JSON);
-    if (!needFinalize && offsetInChunk < numValues) [[unlikely]] {
-        needFinalize = true;
-    }
+    markOverwrite(offsetInChunk);
     nullData->setNull(offsetInChunk, vector->isNull(offsetInVector));
     if (offsetInChunk >= numValues) {
         updateNumValues(offsetInChunk + 1);
@@ -173,9 +189,7 @@ void StringChunkData::write(ColumnChunkData* chunk, ColumnChunkData* dstOffsets,
     auto& stringChunk = chunk->cast<StringChunkData>();
     for (auto i = 0u; i < chunk->getNumValues(); i++) {
         auto offsetInChunk = dstOffsets->getValue<offset_t>(i);
-        if (!needFinalize && offsetInChunk < numValues) [[unlikely]] {
-            needFinalize = true;
-        }
+        markOverwrite(offsetInChunk);
         bool isNull = chunk->getNullData()->isNull(i);
         nullData->setNull(offsetInChunk, isNull);
         if (offsetInChunk >= numValues) {
