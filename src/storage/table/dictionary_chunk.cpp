@@ -24,7 +24,7 @@ static constexpr uint64_t INITIAL_OFFSET_CHUNK_CAPACITY = 3;
 
 DictionaryChunk::DictionaryChunk(MemoryManager& mm, uint64_t capacity, bool enableCompression,
     ResidencyState residencyState)
-    : enableCompression{enableCompression}, indexTable(this) {
+    : enableCompression{enableCompression}, deduplicate{enableCompression}, indexTable(this) {
     // Bitpacking might save 1 bit per value with regular ascii compared to UTF-8
     stringDataChunk = ColumnChunkFactory::createColumnChunkData(mm, LogicalType::UINT8(),
         false /*enableCompression*/, 0, residencyState, false /*hasNullData*/);
@@ -37,6 +37,16 @@ void DictionaryChunk::resetToEmpty() {
     stringDataChunk->resetToEmpty();
     offsetChunk->resetToEmpty();
     indexTable.clear();
+    deduplicate = enableCompression;
+    numLookups = 0;
+}
+
+void DictionaryChunk::sampleDeduplication() {
+    // Fewer than two lookups per distinct value: at most half of the values were duplicates.
+    if (numLookups < 2 * DEDUPLICATION_SAMPLE_SIZE) {
+        deduplicate = false;
+        indexTable.release();
+    }
 }
 
 uint64_t DictionaryChunk::getStringLength(string_index_t index) const {
@@ -70,7 +80,8 @@ void DictionaryChunk::validateStringRange(string_offset_t startOffset,
 
 DictionaryChunk::string_index_t DictionaryChunk::appendString(std::string_view val) {
     // If the string already exists in the dictionary, skip it and refer to the existing string
-    if (enableCompression) {
+    if (deduplicate) {
+        numLookups++;
         if (const auto found = indexTable.find(val)) {
             return *found;
         }
@@ -90,8 +101,11 @@ DictionaryChunk::string_index_t DictionaryChunk::appendString(std::string_view v
     }
     offsetChunk->setValue<string_offset_t>(startOffset, index);
     offsetChunk->setNumValues(index + 1);
-    if (enableCompression) {
+    if (deduplicate) {
         indexTable.insert(static_cast<string_index_t>(index));
+        if (indexTable.size() == DEDUPLICATION_SAMPLE_SIZE) {
+            sampleDeduplication();
+        }
     }
     return index;
 }

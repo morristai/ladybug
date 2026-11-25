@@ -28,6 +28,11 @@ public:
         offsetChunk->setToInMemory();
         indexTable.clear();
     }
+
+    // Whether appendString still looks up and indexes values. Starts as enableCompression and
+    // turns off once the sampled values are mostly distinct.
+    bool isDeduplicating() const { return deduplicate; }
+
     void resetToEmpty();
 
     uint64_t getStringLength(string_index_t index) const;
@@ -70,7 +75,18 @@ private:
     // underflow that is later used as a string_view length.
     void validateStringRange(string_offset_t startOffset, string_offset_t endOffset) const;
 
+    // De-duplication is sampled when the dictionary reaches this many distinct values. A column
+    // whose values are mostly distinct (relationship or asset IDs) gains almost nothing from it
+    // and pays a hash probe, an insert and the index table's memory per value. Kept below
+    // CHUNKED_NODE_GROUP_CAPACITY so the 2048-row chunks of rel COPY partitions are sampled too.
+    static constexpr uint64_t DEDUPLICATION_SAMPLE_SIZE = 1024;
+
+    void sampleDeduplication();
+
     bool enableCompression;
+    bool deduplicate;
+    // appendString calls that probed the index table since construction or resetToEmpty.
+    uint64_t numLookups = 0;
     // String data is stored as a UINT8 chunk, using the numValues in the chunk to track the number
     // of characters stored.
     std::unique_ptr<ColumnChunkData> stringDataChunk;
@@ -89,6 +105,14 @@ private:
             slots.clear();
             numElements = 0;
         }
+
+        // clear() keeps the slot array for reuse; this frees it.
+        void release() {
+            std::vector<Slot>().swap(slots);
+            numElements = 0;
+        }
+
+        uint64_t size() const { return numElements; }
 
         std::optional<string_index_t> find(std::string_view key) const {
             if (slots.empty()) {

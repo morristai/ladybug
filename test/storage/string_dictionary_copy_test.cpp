@@ -27,6 +27,11 @@ public:
     std::string getInputDir() override { return TestHelper::appendLbugRootPath("dataset/empty/"); }
 };
 
+std::unique_ptr<DictionaryChunk> makeDictionary(MemoryManager& mm) {
+    return std::make_unique<DictionaryChunk>(mm, 8 /*capacity*/, true /*enableCompression*/,
+        ResidencyState::IN_MEMORY);
+}
+
 uint64_t dictionarySize(const DictionaryChunk& dict) {
     return dict.getOffsetChunk()->getNumValues();
 }
@@ -43,6 +48,39 @@ void writeString(StringChunkData& chunk, ValueVector& vector, offset_t row,
         StringVector::addString(&vector, 0, *value);
     }
     chunk.write(&vector, 0, row);
+}
+
+TEST_F(StringDictionaryCopyTest, LowCardinalityValuesStayDeduplicated) {
+    auto dict = makeDictionary(*getMemoryManager(*database));
+    for (auto i = 0u; i < 10000; i++) {
+        const auto value = "semantic-" + std::to_string(i % 20);
+        EXPECT_EQ(dict->getString(dict->appendString(value)), value);
+    }
+    EXPECT_TRUE(dict->isDeduplicating());
+    EXPECT_EQ(dictionarySize(*dict), 20u);
+}
+
+TEST_F(StringDictionaryCopyTest, MostlyDistinctValuesStopDeduplicating) {
+    auto dict = makeDictionary(*getMemoryManager(*database));
+    std::vector<DictionaryChunk::string_index_t> indexes;
+    for (auto i = 0u; i < 3000; i++) {
+        indexes.push_back(dict->appendString("relationship-" + std::to_string(i)));
+    }
+    EXPECT_FALSE(dict->isDeduplicating());
+    // Once de-duplication stops, a repeated value gets its own entry and still reads back.
+    const auto repeated = dict->appendString("relationship-0");
+    EXPECT_EQ(dictionarySize(*dict), 3001u);
+    EXPECT_NE(repeated, indexes[0]);
+    EXPECT_EQ(dict->getString(repeated), "relationship-0");
+    for (auto i = 0u; i < indexes.size(); i++) {
+        EXPECT_EQ(dict->getString(indexes[i]), "relationship-" + std::to_string(i));
+    }
+
+    dict->resetToEmpty();
+    EXPECT_TRUE(dict->isDeduplicating());
+    dict->appendString("relationship-0");
+    dict->appendString("relationship-0");
+    EXPECT_EQ(dictionarySize(*dict), 1u);
 }
 
 // Rel COPY resets a node group's chunk to all-null and scatters rows into it in CSR order, so
