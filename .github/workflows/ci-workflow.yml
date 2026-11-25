@@ -102,6 +102,9 @@ jobs:
       - name: Check extension files for std::assert
         run: ./scripts/check-no-std-assert.sh extension
 
+      - name: Test the extension deploy scripts
+        run: python3 -m unittest discover -s scripts/extension -p 'test_*.py' -v
+
       - name: Ensure generated grammar files are up to date
         run: |
           python3 scripts/antlr4/hash.py src/antlr4/keywords.txt src/antlr4/Cypher.g4 > tmphashfile
@@ -341,7 +344,7 @@ jobs:
 
   minimal-linux-extension-test:
     name: minimal linux extension test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all' }}
     env:
       GEN: Ninja

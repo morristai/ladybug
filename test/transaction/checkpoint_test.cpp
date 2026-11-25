@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -25,6 +27,8 @@
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/checksum.h"
+#include "common/exception/internal.h"
+#include "common/exception/io.h"
 #include "common/exception/runtime.h"
 #include "common/file_system/virtual_file_system.h"
 #include "common/serializer/buffer_reader.h"
@@ -39,6 +43,7 @@
 #include "storage/checkpointer.h"
 #include "storage/database_header.h"
 #include "storage/index/index.h"
+#include "storage/optimistic_allocator.h"
 #include "storage/page_allocator.h"
 #include "storage/page_manager.h"
 #include "storage/shadow_file.h"
@@ -92,6 +97,51 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return false;
+    }
+
+    // Returns whether a checkpoint closed the write gate within 10 s. A BEGIN holds the gate's
+    // mutex only briefly, so it counts as closed once it stays held across a 20 ms gap.
+    static bool waitForWriteGateClosed(main::ClientContext& context) {
+        auto* transactionManager = TransactionManager::Get(context);
+        const auto isHeld = [transactionManager]() {
+            std::unique_lock lck{transactionManager->mtxForStartingNewTransactions,
+                std::try_to_lock};
+            return !lck.owns_lock();
+        };
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const bool held = isHeld();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (held && isHeld()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static std::unique_lock<std::mutex> lockWriteGate(main::ClientContext& context) {
+        return std::unique_lock{TransactionManager::Get(context)->mtxForStartingNewTransactions};
+    }
+
+    static void ageAutoCheckpointDeferral(main::ClientContext& context) {
+        auto* manager = TransactionManager::Get(context);
+        std::lock_guard lock{manager->mtxForCheckpoint};
+        manager->firstAutoCheckpointSkip -= std::chrono::minutes(1);
+    }
+
+    // Holds the mutex that every begin, commit and rollback takes for 100 ms on a new thread, and
+    // returns once it is held.
+    static std::thread holdPublicMutexBriefly(main::ClientContext& context) {
+        auto* transactionManager = TransactionManager::Get(context);
+        std::promise<void> held;
+        auto heldFuture = held.get_future();
+        std::thread holder([transactionManager, held = std::move(held)]() mutable {
+            std::unique_lock lck{transactionManager->mtxForSerializingPublicFunctionCalls};
+            held.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        });
+        heldFuture.wait();
+        return holder;
     }
 
 private:
@@ -419,6 +469,54 @@ TEST_F(CheckpointRetryAfterFailureTest, FailedRollbackPoisonsWAL) {
     checkNodes(100);
 }
 
+// A node group whose shadow savepoint restore failed records that on the shadow file (see
+// CSRNodeGroup::checkpoint). The failed checkpoint's rollback must then poison the WAL with the
+// recorded errors, so no later checkpoint or write builds on the affected shadow pages.
+class FlakyCheckpointerWithFailedSavepointRestore final : public Checkpointer {
+public:
+    explicit FlakyCheckpointerWithFailedSavepointRestore(main::ClientContext& context)
+        : Checkpointer(context) {}
+
+protected:
+    bool checkpointStorage() override {
+        mainStorageManager->getShadowFile().recordSavepointRollbackFailure(
+            "injected page restore failure");
+        throw RuntimeException("checkpoint failed.");
+    }
+};
+
+TEST_F(CheckpointRetryAfterFailureTest, FailedSavepointRestorePoisonsWAL) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertNodes(0, 100);
+    FlakyCheckpointer flakyCheckpointer([](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerWithFailedSavepointRestore>(context);
+    });
+    flakyCheckpointer.setCheckpointer(*getClientContext(*conn));
+    auto res = conn->query("CHECKPOINT;");
+    ASSERT_FALSE(res->isSuccess());
+    EXPECT_NE(res->getErrorMessage().find("refuses further writes until restart"),
+        std::string::npos)
+        << res->getErrorMessage();
+    EXPECT_NE(res->getErrorMessage().find("injected page restore failure"), std::string::npos)
+        << res->getErrorMessage();
+    FlakyCheckpointer::resetCheckpointer(*getClientContext(*conn));
+    // Neither a retried checkpoint nor a write may build on the shadow pages.
+    res = conn->query("CHECKPOINT;");
+    ASSERT_FALSE(res->isSuccess());
+    EXPECT_NE(res->getErrorMessage().find("panic state"), std::string::npos)
+        << res->getErrorMessage();
+    res = conn->query("CREATE (a:test {id: 100, name: 'name_100'});");
+    ASSERT_FALSE(res->isSuccess());
+    EXPECT_NE(res->getErrorMessage().find("injected page restore failure"), std::string::npos)
+        << res->getErrorMessage();
+    res.reset();
+    // Reopening discards the uncommitted shadow file and replays the WAL.
+    createDBAndConn();
+    checkNodes(100);
+}
+
 class FlakyCheckpointerFailsOnSerialization final : public Checkpointer {
 public:
     explicit FlakyCheckpointerFailsOnSerialization(main::ClientContext& context)
@@ -567,6 +665,102 @@ TEST_F(CheckpointRetryAfterFailureTest, RetryAfterFailureWithDurableCheckpointRe
     checkNodes(100);
 }
 
+// Injects an I/O error during apply while leaving the durable shadow file intact for recovery.
+class FailSecondShadowRead final : public FileSystem {
+public:
+    FailSecondShadowRead(FileInfo& shadow, std::unique_ptr<FileInfo> delegate)
+        : shadow{shadow}, delegate{std::move(delegate)}, original{shadow.fileSystem} {
+        shadow.fileSystem = this;
+    }
+
+    ~FailSecondShadowRead() override { shadow.fileSystem = original; }
+
+    void syncFile(const FileInfo&) const override { delegate->syncFile(); }
+
+protected:
+    void readFromFile(FileInfo&, void* buffer, uint64_t numBytes,
+        uint64_t position) const override {
+        if (++numReads == 2) {
+            throw IOException{"Injected failure reading the second checkpoint shadow page."};
+        }
+        delegate->readFromFile(buffer, numBytes, position);
+    }
+
+    int64_t readFile(FileInfo&, void* buffer, size_t numBytes) const override {
+        return delegate->readFile(buffer, numBytes);
+    }
+
+    void writeFile(FileInfo&, const uint8_t* buffer, uint64_t numBytes,
+        uint64_t offset) const override {
+        delegate->writeFile(buffer, numBytes, offset);
+    }
+
+    int64_t seek(FileInfo&, uint64_t offset, int whence) const override {
+        return delegate->seek(offset, whence);
+    }
+
+    uint64_t getFileSize(const FileInfo&) const override { return delegate->getFileSize(); }
+
+private:
+    FileInfo& shadow;
+    std::unique_ptr<FileInfo> delegate;
+    FileSystem* original;
+    mutable size_t numReads = 0;
+};
+
+class CheckpointerFailsDuringShadowApply final : public Checkpointer {
+public:
+    explicit CheckpointerFailsDuringShadowApply(main::ClientContext& context)
+        : Checkpointer(context) {}
+
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        auto& shadow = *mainStorageManager->getShadowFile().getShadowingFH().getFileInfo();
+        auto* vfs = VirtualFileSystem::GetUnsafe(clientContext);
+        FailSecondShadowRead failure{shadow,
+            vfs->openFile(shadow.path, FileOpenFlags{FileFlags::READ_ONLY | FileFlags::WRITE},
+                &clientContext)};
+        Checkpointer::logCheckpointAndApplyShadowPages(walRotated);
+    }
+};
+
+TEST_F(CheckpointRetryAfterFailureTest, PartialShadowApplyRejectsPKReadsUntilReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertNodes(0, 100);
+    checkpoint();
+    insertNodes(100, 200);
+
+    auto* context = getClientContext(*conn);
+    FlakyCheckpointer failingCheckpoint([](main::ClientContext& clientContext) {
+        return std::make_unique<CheckpointerFailsDuringShadowApply>(clientContext);
+    });
+    failingCheckpoint.setCheckpointer(*context);
+    auto result = conn->query("CHECKPOINT;");
+    FlakyCheckpointer::resetCheckpointer(*context);
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("Injected failure reading the second checkpoint"),
+        std::string::npos);
+
+    const auto oldKeyQuery = "MATCH (t:test) WHERE t.id = 0 RETURN t.name;";
+    auto rejectedRead = conn->query(oldKeyQuery);
+    ASSERT_FALSE(rejectedRead->isSuccess());
+    EXPECT_NE(rejectedRead->getErrorMessage().find("Primary key index is unavailable"),
+        std::string::npos);
+
+    createDBAndConn();
+    checkNodes(200);
+    for (const auto key : {0, 100, 199}) {
+        auto lookup =
+            conn->query(std::format("MATCH (t:test) WHERE t.id = {} RETURN t.name;", key));
+        ASSERT_TRUE(lookup->isSuccess()) << lookup->getErrorMessage();
+        ASSERT_TRUE(lookup->hasNext()) << key;
+        EXPECT_EQ(lookup->getNext()->getValue(0)->getValue<std::string>(),
+            std::format("name_{}", key));
+        EXPECT_FALSE(lookup->hasNext()) << key;
+    }
+}
+
 TEST_F(CheckpointRetryAfterFailureTest, FailedRetryKeepsDurableCheckpointRecord) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
@@ -581,6 +775,28 @@ TEST_F(CheckpointRetryAfterFailureTest, FailedRetryKeepsDurableCheckpointRecord)
     ASSERT_TRUE(std::filesystem::exists(frozenWALPath));
     createDBAndConn();
     checkNodes(100);
+}
+
+TEST_F(CheckpointRetryAfterFailureTest, FailedCheckpointRollsBackOverClosedPartitionShadows) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    // The first checkpoint leaves each partition's shadow file closed; a checkpoint that fails
+    // before reopening them must still roll back over them (#1396).
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE partitioned(id INT64 PRIMARY KEY, amount INT64) "
+                            "PARTITION BY HASH(amount) PARTITIONS 2;")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:partitioned_p0 {id: 1, amount: 10});")->isSuccess());
+    checkpoint();
+    insertNodes(0, 100);
+    failCheckpoint();
+    checkpoint();
+    checkNodes(100);
+    createDBAndConn();
+    checkNodes(100);
+    auto result = conn->query("MATCH (n:partitioned) RETURN COUNT(n);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
 }
 
 TEST_F(CheckpointRetryAfterFailureTest, MainMarkerRecoversLegacyPartitionShadows) {
@@ -937,7 +1153,81 @@ TEST_F(PostCommitCheckpointFailureTest, NextCommitRetriesFailedAutoCheckpoint) {
     checkNodes(2);
 }
 
-TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointBlockedByOpenWriterDoesNotFailCommit) {
+TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointSkipsOpenWriter) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    createDB(2000000 /* checkpoint wait timeout in microseconds */);
+    conn = std::make_unique<main::Connection>(database.get());
+    checkpointAfterEveryCommit();
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true;")->isSuccess());
+    auto context = getClientContext(*conn);
+    countCheckpoints<FlakyCheckpointerFailsOnCheckpointStorage>();
+    failCheckpoints = false;
+    {
+        main::Connection other{database.get()};
+        ASSERT_TRUE(other.query("BEGIN TRANSACTION;")->isSuccess());
+        ASSERT_TRUE(other.query("CREATE (a:test {id: 3, name: 'name_3'});")->isSuccess());
+        ::testing::internal::CaptureStderr();
+        const auto start = std::chrono::steady_clock::now();
+        for (auto i = 0; i < 3; ++i) {
+            insertNodes(i, i + 1);
+        }
+        const auto waited = std::chrono::steady_clock::now() - start;
+        const auto log = ::testing::internal::GetCapturedStderr();
+        EXPECT_LT(waited, std::chrono::seconds(1));
+        const auto first = log.find("Automatic checkpoint deferred for writers");
+        ASSERT_NE(first, std::string::npos) << log;
+        EXPECT_EQ(log.find("Automatic checkpoint deferred for writers", first + 1),
+            std::string::npos)
+            << log;
+        EXPECT_EQ(log.find("Warning:"), std::string::npos) << log;
+        EXPECT_EQ(numCheckpoints, 0u);
+        EXPECT_GT(WAL::Get(*context)->getFileSize(), 0u);
+        ::testing::internal::CaptureStderr();
+        auto res = other.query("COMMIT;");
+        const auto completion = ::testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        EXPECT_NE(completion.find("automatic checkpoint deferrals = 3"), std::string::npos)
+            << completion;
+        EXPECT_EQ(numCheckpoints, 1u);
+        EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    }
+    createDBAndConn();
+    checkNodes(4);
+}
+
+TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointDrainsWritersAfterDeferralExpires) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true")->isSuccess());
+    auto context = getClientContext(*conn);
+    countCheckpoints<FlakyCheckpointerFailsOnCheckpointStorage>();
+    failCheckpoints = false;
+    {
+        main::Connection other{database.get()};
+        ASSERT_TRUE(other.query("BEGIN TRANSACTION")->isSuccess());
+        ASSERT_TRUE(other.query("CREATE (:test {id: 2})")->isSuccess());
+        insertNodes(0, 1);
+        FlakyCheckpointer::ageAutoCheckpointDeferral(*context);
+        std::unique_ptr<main::QueryResult> result;
+        std::thread committing([&] { result = conn->query("CREATE (:test {id: 1})"); });
+        const bool gateClosed = FlakyCheckpointer::waitForWriteGateClosed(*context);
+        auto otherResult = other.query("COMMIT");
+        committing.join();
+        ASSERT_TRUE(gateClosed);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_TRUE(otherResult->isSuccess()) << otherResult->getErrorMessage();
+        EXPECT_EQ(numCheckpoints, 1u);
+        EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    }
+    createDBAndConn();
+    checkNodes(3);
+}
+
+TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointRetriesAtWALGrowthLimit) {
     if (inMemMode) {
         GTEST_SKIP();
     }
@@ -945,22 +1235,214 @@ TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointBlockedByOpenWriterDoesNot
     createDB(10000 /* checkpoint wait timeout in microseconds */);
     conn = std::make_unique<main::Connection>(database.get());
     checkpointAfterEveryCommit();
-    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true;")->isSuccess());
-    auto context = getClientContext(*conn);
-    main::Connection other{database.get()};
-    ASSERT_TRUE(other.query("BEGIN TRANSACTION;")->isSuccess());
-    ASSERT_TRUE(other.query("CREATE (a:test {id: 1, name: 'name_1'});")->isSuccess());
-    // This commit's checkpoint times out waiting for the other connection's write transaction.
-    insertNodes(0, 1);
-    EXPECT_GT(WAL::Get(*context)->getFileSize(), 0u);
-    auto res = other.query("COMMIT;");
-    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
-    EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true")->isSuccess());
+    {
+        main::Connection other{database.get()};
+        ASSERT_TRUE(other.query("BEGIN TRANSACTION")->isSuccess());
+        ASSERT_TRUE(other.query("CREATE (:test {id: 9})")->isSuccess());
+        insertNodes(0, 1);
+        ::testing::internal::CaptureStderr();
+        auto result = conn->query("CREATE (:test {id: 1, name: repeat('x', 1100000)})");
+        const auto log = ::testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        EXPECT_NE(log.find("Automatic checkpoint waiting for writers"), std::string::npos) << log;
+        EXPECT_NE(log.find("Timeout waiting for active write transactions"), std::string::npos)
+            << log;
+        EXPECT_GE(WAL::Get(*getClientContext(*conn))->getFileSize(), 1100000u);
+        // The already oversized WAL must not make the next small commit wait again.
+        ::testing::internal::CaptureStderr();
+        insertNodes(2, 3);
+        const auto nextLog = ::testing::internal::GetCapturedStderr();
+        EXPECT_NE(nextLog.find("Automatic checkpoint deferred for writers"), std::string::npos)
+            << nextLog;
+        EXPECT_EQ(nextLog.find("waiting for writers"), std::string::npos) << nextLog;
+        ASSERT_TRUE(other.query("ROLLBACK")->isSuccess());
+    }
+    createDBAndConn();
+    checkNodes(3);
+    auto result = conn->query("MATCH (n:test {id: 1}) RETURN n.name");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    EXPECT_EQ(result->getNext()->getValue(0)->getValue<std::string>(), std::string(1100000, 'x'));
+}
+
+TEST_F(PostCommitCheckpointFailureTest, PinnedWALDoesNotRepeatDrainForSameBytes) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true")->isSuccess());
+    auto wal = WAL::Get(*getClientContext(*conn));
+    {
+        main::Connection reader{database.get()};
+        main::Connection writer{database.get()};
+        ASSERT_TRUE(reader.query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+        auto result = conn->query("CREATE (:test {id: 0, name: repeat('x', 1100000)})");
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_GE(wal->getFileSize(), 1100000u);
+        ASSERT_TRUE(writer.query("BEGIN TRANSACTION")->isSuccess());
+        ::testing::internal::CaptureStderr();
+        insertNodes(1, 2);
+        const auto log = ::testing::internal::GetCapturedStderr();
+        EXPECT_NE(log.find("Automatic checkpoint deferred for writers"), std::string::npos) << log;
+        EXPECT_EQ(log.find("waiting for writers"), std::string::npos) << log;
+        ASSERT_TRUE(reader.query("COMMIT")->isSuccess());
+        ASSERT_TRUE(writer.query("COMMIT")->isSuccess());
+        EXPECT_EQ(wal->getFileSize(), 0u);
+    }
+    createDBAndConn();
     checkNodes(2);
 }
 
-// A COPY is durable only once its checkpoint runs, so it must not commit while another write
-// transaction could keep that checkpoint from running.
+TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointSkipsBusyWriteGate) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    auto context = getClientContext(*conn);
+    countCheckpoints<FlakyCheckpointerFailsOnCheckpointStorage>();
+    failCheckpoints = false;
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    insertNodes(0, 1);
+    auto gate = FlakyCheckpointer::lockWriteGate(*context);
+    std::unique_ptr<main::QueryResult> res;
+    std::promise<void> committed;
+    auto finished = committed.get_future();
+    std::thread committing([&]() {
+        res = conn->query("COMMIT;");
+        committed.set_value();
+    });
+    const auto status = finished.wait_for(std::chrono::seconds(1));
+    gate.unlock();
+    committing.join();
+    ASSERT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    EXPECT_EQ(numCheckpoints, 0u);
+    EXPECT_GT(WAL::Get(*context)->getFileSize(), 0u);
+    res.reset();
+    createDBAndConn();
+    checkNodes(1);
+    context = getClientContext(*conn);
+    checkpointAfterEveryCommit();
+    countCheckpoints<FlakyCheckpointerFailsOnCheckpointStorage>();
+    insertNodes(1, 2);
+    EXPECT_EQ(numCheckpoints, 1u);
+    EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    createDBAndConn();
+    checkNodes(2);
+}
+
+TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointRunsBesideOpenReader) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    countCheckpoints<FlakyCheckpointerFailsOnCheckpointStorage>();
+    failCheckpoints = false;
+    {
+        main::Connection reader{database.get()};
+        ASSERT_TRUE(reader.query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+        insertNodes(0, 1);
+        EXPECT_EQ(numCheckpoints, 1u);
+        auto res = reader.query("MATCH (a:test) RETURN COUNT(a);");
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        EXPECT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 0);
+        ASSERT_TRUE(reader.query("COMMIT;")->isSuccess());
+    }
+    insertNodes(1, 2);
+    EXPECT_EQ(numCheckpoints, 2u);
+    EXPECT_EQ(WAL::Get(*getClientContext(*conn))->getFileSize(), 0u);
+    createDBAndConn();
+    checkNodes(2);
+}
+
+// A writer waiting at an explicit checkpoint's gate must let readers and active writers finish.
+TEST_F(PostCommitCheckpointFailureTest, WriterWaitingBehindExplicitCheckpointLetsOthersThrough) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    createDB(10000000 /* checkpoint wait timeout in microseconds */);
+    conn = std::make_unique<main::Connection>(database.get());
+    checkpointAfterEveryCommit();
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true;")->isSuccess());
+    main::Connection openWriter{database.get()};
+    main::Connection waitingWriter{database.get()};
+    main::Connection reader{database.get()};
+    insertNodes(0, 1);
+    ASSERT_TRUE(openWriter.query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(openWriter.query("CREATE (a:test {id: 1, name: 'name_1'});")->isSuccess());
+    std::unique_ptr<main::QueryResult> checkpointRes;
+    std::thread checkpointing([&]() { checkpointRes = conn->query("CHECKPOINT;"); });
+    const bool gateClosed = FlakyCheckpointer::waitForWriteGateClosed(*getClientContext(*conn));
+    std::unique_ptr<main::QueryResult> waitingRes;
+    std::promise<void> waitingStarted;
+    std::thread waiting([&waitingWriter, &waitingRes, &waitingStarted]() {
+        waitingStarted.set_value();
+        waitingRes = waitingWriter.query("CREATE (a:test {id: 2, name: 'name_2'});");
+    });
+    waitingStarted.get_future().wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto start = std::chrono::steady_clock::now();
+    auto readRes = reader.query("MATCH (a:test) RETURN COUNT(a);");
+    auto commitRes = openWriter.query("COMMIT;");
+    const auto waited = std::chrono::steady_clock::now() - start;
+    checkpointing.join();
+    waiting.join();
+    ASSERT_TRUE(gateClosed);
+    ASSERT_TRUE(checkpointRes->isSuccess()) << checkpointRes->getErrorMessage();
+    ASSERT_TRUE(readRes->isSuccess()) << readRes->getErrorMessage();
+    ASSERT_TRUE(commitRes->isSuccess()) << commitRes->getErrorMessage();
+    ASSERT_TRUE(waitingRes->isSuccess()) << waitingRes->getErrorMessage();
+    EXPECT_LT(waited, std::chrono::seconds(5));
+    checkNodes(3);
+}
+
+TEST_F(PostCommitCheckpointFailureTest, WriterWaitingAtWriteGateDoesNotPinCheckpoint) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    auto context = getClientContext(*conn);
+    main::Connection waitingWriter{database.get()};
+    std::thread waiting;
+    // Checkpointers are created with the write gate closed.
+    FlakyCheckpointer writerArrives(
+        [&waiting, &waitingWriter](main::ClientContext& ctx) -> std::unique_ptr<Checkpointer> {
+            std::promise<void> started;
+            auto startedFuture = started.get_future();
+            waiting = std::thread([&waitingWriter, started = std::move(started)]() mutable {
+                started.set_value();
+                waitingWriter.query("BEGIN TRANSACTION;");
+            });
+            startedFuture.wait();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return std::make_unique<Checkpointer>(ctx);
+        });
+    writerArrives.setCheckpointer(*context);
+    insertNodes(0, 1);
+    FlakyCheckpointer::resetCheckpointer(*context);
+    waiting.join();
+    EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    ASSERT_TRUE(waitingWriter.query("COMMIT;")->isSuccess());
+    checkNodes(1);
+}
+
+TEST_F(PostCommitCheckpointFailureTest, BusyPublicMutexDoesNotPinCheckpoint) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    auto context = getClientContext(*conn);
+    std::thread holder;
+    // Checkpointers are created with the write gate closed.
+    FlakyCheckpointer publicMutexBusy(
+        [&holder](main::ClientContext& ctx) -> std::unique_ptr<Checkpointer> {
+            holder = FlakyCheckpointer::holdPublicMutexBriefly(ctx);
+            return std::make_unique<Checkpointer>(ctx);
+        });
+    publicMutexBusy.setCheckpointer(*context);
+    insertNodes(0, 1);
+    FlakyCheckpointer::resetCheckpointer(*context);
+    holder.join();
+    EXPECT_EQ(WAL::Get(*context)->getFileSize(), 0u);
+    checkNodes(1);
+}
+
 TEST_F(PostCommitCheckpointFailureTest, CopyBesideOpenWriterCommitsNothing) {
     if (inMemMode) {
         GTEST_SKIP();
@@ -1071,6 +1553,99 @@ TEST_F(PostCommitCheckpointFailureTest, ConcurrentCopiesDoNotWaitForEachOther) {
     ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
     EXPECT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 0);
 }
+
+class ConcurrentCopyRollbackTest
+    : public PostCommitCheckpointFailureTest,
+      public ::testing::WithParamInterface<std::tuple<bool, unsigned, bool, bool>> {};
+
+TEST_P(ConcurrentCopyRollbackTest, PreservesOtherCopy) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    const auto [rel, rollbackMode, existingRows, largeCopy] = GetParam();
+    const auto rejectedCommit = rollbackMode == 1;
+    ASSERT_TRUE(conn->query("CALL enable_multi_writes=true")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE N(id INT64 PRIMARY KEY)")->isSuccess());
+    if (rel) {
+        ASSERT_TRUE(conn->query("CREATE (:N {id: 0}), (:N {id: 1})")->isSuccess());
+        ASSERT_TRUE(conn->query("CREATE REL TABLE K(FROM N TO N, value INT64)")->isSuccess());
+    }
+    const auto copy = [rel](int64_t first, int64_t last) {
+        return rel ? std::format("COPY K FROM (UNWIND range({}, {}) AS i "
+                                 "RETURN 0 AS FROM, 1 AS TO, i AS value)",
+                         first, last) :
+                     std::format("COPY N FROM (UNWIND range({}, {}) AS i RETURN i)", first, last);
+    };
+    if (existingRows) {
+        ASSERT_TRUE(conn->query(copy(-5, -1))->isSuccess());
+    }
+    if (rollbackMode == 2) {
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false")->isSuccess());
+    }
+    const auto checkRows = [&](bool reusedKeys) {
+        auto result = conn->query(rel ? "MATCH ()-[r:K]->() RETURN r.value ORDER BY r.value" :
+                                        "MATCH (n:N) RETURN n.id ORDER BY n.id");
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_EQ(result->getNumTuples(), 100 + (existingRows ? 5 : 0) + (reusedKeys ? 3 : 0));
+        if (existingRows) {
+            for (auto id = -5; id < 0; ++id) {
+                EXPECT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), id);
+            }
+        }
+        for (auto id = 1; id <= 100; ++id) {
+            EXPECT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), id);
+        }
+        if (reusedKeys) {
+            for (auto id = 1000; id <= 1002; ++id) {
+                EXPECT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), id);
+            }
+        }
+    };
+    {
+        main::Connection other{database.get()};
+        ASSERT_TRUE(other.query("BEGIN TRANSACTION")->isSuccess());
+        const auto numRows = largeCopy ? StorageConfig::NODE_GROUP_SIZE + 1 : 100;
+        auto result = other.query(copy(1000, 999 + numRows));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        std::unique_ptr<main::QueryResult> committedCopy;
+        std::thread writer([&]() { committedCopy = conn->query(copy(1, 100)); });
+        bool pending = true;
+        if (rollbackMode == 2) {
+            writer.join();
+        } else {
+            pending = FlakyCheckpointer::waitForForcedCheckpointPending(*getClientContext(*conn));
+        }
+        result = other.query(rejectedCommit ? "COMMIT" : "ROLLBACK");
+        if (writer.joinable()) {
+            writer.join();
+        }
+        ASSERT_TRUE(pending);
+        ASSERT_TRUE(committedCopy->isSuccess()) << committedCopy->getErrorMessage();
+        if (rejectedCommit) {
+            ASSERT_FALSE(result->isSuccess());
+            EXPECT_NE(result->getErrorMessage().find("The transaction was rolled back"),
+                std::string::npos);
+        } else {
+            ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        }
+        checkRows(false);
+    }
+    if (rollbackMode == 2) {
+        ASSERT_TRUE(conn->query("CHECKPOINT")->isSuccess());
+    }
+    // The successful COPY must survive reopening without another checkpoint on close.
+    createDBAndConn();
+    checkRows(false);
+    // Rolled-back primary keys and CSR row ranges must remain usable by later COPYs.
+    ASSERT_TRUE(conn->query(copy(1000, 1002))->isSuccess());
+    checkRows(true);
+    createDBAndConn();
+    checkRows(true);
+}
+
+INSTANTIATE_TEST_SUITE_P(NodeAndRel, ConcurrentCopyRollbackTest,
+    ::testing::Combine(::testing::Bool(), ::testing::Values(0u, 1u, 2u), ::testing::Bool(),
+        ::testing::Bool()));
 
 TEST_F(PostCommitCheckpointFailureTest, AutoCheckpointThatPoisonsWALFailsNextWrite) {
     if (inMemMode) {
@@ -1224,6 +1799,137 @@ TEST_F(CheckpointRetryAfterFailureTest, CommittedPartitionRecoveryRejectsMissing
     database.reset();
     ASSERT_TRUE(std::filesystem::remove(missingPath));
     EXPECT_THROW(createDBAndConn(), RuntimeException);
+}
+
+// A dropped or renamed-away partition child keeps its data file until the next checkpoint
+// retires it. A partitioned table created under the same name before then used to open that same
+// file for writing; the checkpoint then deleted it, and the database no longer opened.
+class PartitionChildFileReuseTest : public CheckpointRetryAfterFailureTest {
+public:
+    void run(const std::string& query) const {
+        auto res = conn->query(query);
+        ASSERT_TRUE(res->isSuccess()) << query << ": " << res->getErrorMessage();
+    }
+
+    std::vector<int64_t> ids(const std::string& table) const {
+        auto res = conn->query(std::format("MATCH (n:{}) RETURN n.id ORDER BY n.id;", table));
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        std::vector<int64_t> out;
+        while (res->isSuccess() && res->hasNext()) {
+            out.push_back(res->getNext()->getValue(0)->getValue<int64_t>());
+        }
+        return out;
+    }
+
+    static std::vector<int64_t> range(int64_t begin, int64_t end) {
+        std::vector<int64_t> out;
+        for (auto i = begin; i < end; i++) {
+            out.push_back(i);
+        }
+        return out;
+    }
+
+    void createPartitioned(const std::string& table, int64_t begin, int64_t end) const {
+        run(std::format("CREATE NODE TABLE {}(id INT64 PRIMARY KEY, k INT64) PARTITION BY "
+                        "HASH(k) PARTITIONS 3;",
+            table));
+        run(std::format("UNWIND range({}, {}) AS i CREATE (:{} {{id: i, k: i}});", begin, end - 1,
+            table));
+    }
+
+    void reopen() {
+        conn.reset();
+        database.reset();
+        createDBAndConn();
+    }
+};
+
+TEST_F(PartitionChildFileReuseTest, RecreatedBeforeCheckpointKeepsItsRows) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    createPartitioned("P", 0, 100);
+    checkpoint();
+    run("DROP TABLE P;");
+    createPartitioned("P", 1000, 1200);
+    checkpoint();
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+    reopen();
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+    // The child keeps its table-ID file across further checkpoints and reopens.
+    run("UNWIND range(1200, 1210) AS i CREATE (:P {id: i, k: i});");
+    checkpoint();
+    reopen();
+    EXPECT_EQ(ids("P"), range(1000, 1211));
+}
+
+TEST_F(PartitionChildFileReuseTest, RecreatedBeforeCheckpointRecoversFromWAL) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    createPartitioned("P", 0, 100);
+    checkpoint();
+    run("DROP TABLE P;");
+    createPartitioned("P", 1000, 1200);
+    // No checkpoint: recovery opens the dropped child from the checkpointed catalog, then
+    // replays the drop and the new table from the WAL.
+    reopen();
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+    checkpoint();
+    reopen();
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+}
+
+// The checkpoint that moves a renamed child's files used to replace the child's FileHandle,
+// leaving its columns reading through the old, closed one until the database was reopened.
+TEST_F(PartitionChildFileReuseTest, RenamedChildIsReadableAfterCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    createPartitioned("P", 0, 100);
+    checkpoint();
+    run("ALTER TABLE P RENAME TO Q;");
+    checkpoint();
+    EXPECT_EQ(ids("Q"), range(0, 100));
+    run("UNWIND range(100, 110) AS i CREATE (:Q {id: i, k: i});");
+    checkpoint();
+    EXPECT_EQ(ids("Q"), range(0, 111));
+    reopen();
+    EXPECT_EQ(ids("Q"), range(0, 111));
+}
+
+TEST_F(PartitionChildFileReuseTest, CreatedUnderRenamedAwayNameBeforeCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    createPartitioned("P", 0, 100);
+    checkpoint();
+    run("ALTER TABLE P RENAME TO Q;");
+    createPartitioned("P", 1000, 1200);
+    checkpoint();
+    EXPECT_EQ(ids("Q"), range(0, 100));
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+    reopen();
+    EXPECT_EQ(ids("Q"), range(0, 100));
+    EXPECT_EQ(ids("P"), range(1000, 1200));
+}
+
+TEST_F(PartitionChildFileReuseTest, SwappedNamesDoNotOverwriteEachOther) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    createPartitioned("P", 0, 100);
+    createPartitioned("Q", 1000, 1050);
+    checkpoint();
+    run("ALTER TABLE P RENAME TO T;");
+    run("ALTER TABLE Q RENAME TO P;");
+    run("ALTER TABLE T RENAME TO Q;");
+    checkpoint();
+    EXPECT_EQ(ids("Q"), range(0, 100));
+    EXPECT_EQ(ids("P"), range(1000, 1050));
+    reopen();
+    EXPECT_EQ(ids("Q"), range(0, 100));
+    EXPECT_EQ(ids("P"), range(1000, 1050));
 }
 
 TEST_F(CheckpointRetryAfterFailureTest, CommittedRecoveryReplaysChildShadowBeforeParsingChildFile) {
@@ -1782,6 +2488,40 @@ INSTANTIATE_TEST_SUITE_P(ShadowID, LegacyMainWALDatabaseIDTest,
         }
         return std::string{};
     });
+
+// An ABORT record only ever follows its own COMMIT, with no CHECKPOINT between them. One that
+// names no such block is ignored and does not end the WAL: a WAL that ends in a CHECKPOINT whose
+// shadow is not applied yet still recovers through that shadow, instead of replaying the records
+// before an earlier pinned CHECKPOINT a second time.
+TEST_F(CheckpointRetryAfterFailureTest, StrayAbortRecordAfterCheckpointIsIgnored) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertNodes(0, 50);
+    auto reader = std::make_unique<main::Connection>(database.get());
+    ASSERT_TRUE(reader->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+    checkpoint();
+    const auto walPath = StorageUtils::getWALFilePath(databasePath);
+    const auto blockBeforeLastCheckpoint = std::filesystem::file_size(walPath);
+    insertNodes(50, 100);
+    failCheckpointWith<FlakyCheckpointerFailsOnApplyingShadow>();
+    const bool enableChecksums = getClientContext(*conn)->getDBConfig()->enableChecksums;
+    reader.reset();
+    conn.reset();
+    database.reset();
+    std::ofstream wal{walPath, std::ios::binary | std::ios::app};
+    for (const auto start : {uint64_t{1}, static_cast<uint64_t>(blockBeforeLastCheckpoint)}) {
+        const auto record = serializeCheckpointRecord(AbortRecord{start});
+        wal.write(reinterpret_cast<const char*>(record.data.get()), record.size);
+        if (enableChecksums) {
+            const auto recordChecksum = checksum(record.data.get(), record.size);
+            wal.write(reinterpret_cast<const char*>(&recordChecksum), sizeof(recordChecksum));
+        }
+    }
+    wal.close();
+    createDBAndConn();
+    checkNodes(100);
+}
 
 TEST_F(CheckpointRetryAfterFailureTest, LegacyMainShadowRejectsReplacementDatabase) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
@@ -2479,6 +3219,48 @@ TEST_F(FlakyCheckpointerTest, RecoversLegacyFrozenGraphMarkerWithActiveWALCommit
     ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 3);
     EXPECT_FALSE(std::filesystem::exists(graphCheckpointWALPath));
     EXPECT_FALSE(std::filesystem::exists(graphShadowPath));
+}
+
+// Graph commits go to the main WAL, so only a standalone session on the graph's file leaves commits
+// in a graph WAL. The ABORT stands in for a failed publish's, behind a later commit, which another
+// writer can put there. The rows are asserted by id: a standalone session leaves their label and
+// data columns null.
+TEST_F(FlakyCheckpointerTest, AbortRecordSkipsTheTransactionInAGraphWAL) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    LegacyGraphMarkerRecoveryFixture{}.setUp(conn.get());
+    const auto graphPath = StorageUtils::getGraphPath(databasePath, "recovery_graph");
+    const auto graphWALPath = StorageUtils::getWALFilePath(graphPath);
+    conn.reset();
+    database.reset();
+
+    auto graphConfig = *systemConfig;
+    graphConfig.autoCheckpoint = false;
+    graphConfig.forceCheckpointOnClose = false;
+    graphConfig.enableChecksums = false;
+    auto graphDatabase = std::make_unique<main::Database>(graphPath, graphConfig);
+    auto graphConnection = std::make_unique<main::Connection>(graphDatabase.get());
+    ASSERT_TRUE(graphConnection->query("CREATE (:User {name: 'Carol'});")->isSuccess());
+    const auto abortedStart = std::filesystem::file_size(graphWALPath);
+    ASSERT_TRUE(graphConnection->query("CREATE (:User {name: 'Bob'});")->isSuccess());
+    ASSERT_TRUE(graphConnection->query("CREATE (:User {name: 'Dave'});")->isSuccess());
+    graphConnection.reset();
+    graphDatabase.reset();
+    const auto abortRecord = serializeCheckpointRecord(AbortRecord{abortedStart});
+    std::ofstream{graphWALPath, std::ios::binary | std::ios::app}.write(
+        reinterpret_cast<const char*>(abortRecord.data.get()), abortRecord.size);
+
+    createDBAndConn();
+    ASSERT_TRUE(conn->query("USE GRAPH recovery_graph;")->isSuccess());
+    const auto count = [&](const std::string& statement) {
+        auto result = conn->query(statement);
+        EXPECT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        return result->isSuccess() ? result->getNext()->getValue(0)->getValue<int64_t>() : -1;
+    };
+    EXPECT_EQ(count("MATCH (n) RETURN COUNT(n);"), 3);
+    EXPECT_EQ(count("MATCH (n) WHERE n.id = 2 RETURN COUNT(n);"), 0);
+    EXPECT_EQ(count("MATCH (n) WHERE n.id = 3 RETURN COUNT(n);"), 1);
 }
 
 TEST_F(FlakyCheckpointerTest, RejectsActiveGraphMarkerWithNonCheckpointFrozenWAL) {
@@ -5176,6 +5958,215 @@ TEST_F(FlakyCheckpointerTest, ReadBeforeShadowPagesAreAppliedSeesCommittedString
 }
 #endif // __SINGLE_THREADED__
 
+#ifndef __SINGLE_THREADED__
+class CheckpointerWithReadAfterApplyingShadowPages final : public Checkpointer {
+public:
+    CheckpointerWithReadAfterApplyingShadowPages(main::ClientContext& clientContext,
+        std::function<void()> readFunc)
+        : Checkpointer(clientContext), readFunc(std::move(readFunc)) {}
+
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        Checkpointer::logCheckpointAndApplyShadowPages(walRotated);
+        readFunc();
+    }
+
+private:
+    std::function<void()> readFunc;
+};
+
+class CheckpointShadowWindowTest : public FlakyCheckpointerTest {
+protected:
+    static constexpr int64_t numInitialRows = 20000;
+    static constexpr int64_t numRows = 120000;
+    static constexpr int64_t numKeysToCheck = 3000;
+
+    // Checkpoints numInitialRows rows, then commits rows up to numRows. The second batch grows
+    // the hash index enough to split slots that hold keys from the first checkpoint, so the
+    // next checkpoint rewrites slot pages those keys live on. With reopenBeforeGrowth, the
+    // database is reopened after the first checkpoint, so the first batch is only reachable
+    // through the on-disk index rather than the in-memory local storage.
+    void setUpGrowth(const std::string& pkType, const std::string& partitionClause = "",
+        bool reopenBeforeGrowth = false) {
+        stringKeys = pkType == "STRING";
+        const auto keyExpr = stringKeys ? std::string{"'k' + string(i)"} : std::string{"i"};
+        const auto insertRows = [&](int64_t start, int64_t end) {
+            return std::format(
+                "UNWIND range({}, {}) AS i CREATE (:test {{id: {}, name: 'name_' + string(i)}});",
+                start, end - 1, keyExpr);
+        };
+        const auto run = [&](const std::string& query) {
+            auto result = conn->query(query);
+            ASSERT_TRUE(result->isSuccess()) << query << ": " << result->getErrorMessage();
+        };
+        const auto disableAutoCheckpoint = [&]() {
+            run("CALL force_checkpoint_on_close=false;");
+            run("CALL auto_checkpoint=false;");
+        };
+        disableAutoCheckpoint();
+        run(std::format("CREATE NODE TABLE test(id {} PRIMARY KEY, name STRING){};", pkType,
+            partitionClause));
+        run(insertRows(0, numInitialRows));
+        run("CHECKPOINT;");
+        if (reopenBeforeGrowth) {
+            createDBAndConn();
+            disableAutoCheckpoint();
+        }
+        run(insertRows(numInitialRows, numRows));
+    }
+
+    std::string keyLiteral(int64_t key) const {
+        return stringKeys ? std::format("'k{}'", key) : std::to_string(key);
+    }
+
+    bool lookupIsCorrect(main::Connection& readConn, int64_t key) const {
+        auto result = readConn.query(
+            std::format("MATCH (t:test) WHERE t.id = {} RETURN t.name;", keyLiteral(key)));
+        return result->isSuccess() && result->hasNext() &&
+               result->getNext()->getValue(0)->getValue<std::string>() ==
+                   std::format("name_{}", key) &&
+               !result->hasNext();
+    }
+
+    // Wrong lookups among the first numKeysToCheck keys of the checkpointed batch and of the
+    // newly committed batch.
+    std::array<size_t, 2> wrongLookups() const {
+        main::Connection readConn{database.get()};
+        std::array<size_t, 2> wrongKeys{};
+        for (size_t batch = 0; batch < wrongKeys.size(); ++batch) {
+            const auto start = batch == 0 ? 0 : numInitialRows;
+            for (auto key = start; key < start + numKeysToCheck; ++key) {
+                if (!lookupIsCorrect(readConn, key)) {
+                    ++wrongKeys[batch];
+                }
+            }
+        }
+        return wrongKeys;
+    }
+
+    // Looks up keys on another connection right after the shadow pages are applied, before
+    // the checkpoint returns (#1052). This pins the read to that point deterministically.
+    void checkLookupsRightAfterShadowApply() {
+        std::optional<std::array<size_t, 2>> wrongDuringCheckpoint;
+        auto* context = getClientContext(*conn);
+        FlakyCheckpointer checkpointer([&](main::ClientContext& clientContext) {
+            return std::make_unique<CheckpointerWithReadAfterApplyingShadowPages>(clientContext,
+                [&]() { wrongDuringCheckpoint = wrongLookups(); });
+        });
+        checkpointer.setCheckpointer(*context);
+        auto result = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        ASSERT_TRUE(wrongDuringCheckpoint.has_value());
+        EXPECT_EQ((*wrongDuringCheckpoint)[0], 0u)
+            << "previously checkpointed keys after shadow apply";
+        EXPECT_EQ((*wrongDuringCheckpoint)[1], 0u) << "newly committed keys after shadow apply";
+        EXPECT_EQ(wrongLookups(), (std::array<size_t, 2>{})) << "after checkpoint completion";
+    }
+
+    // A reader thread looks up keys from both batches in a loop while the checkpoint runs, so
+    // lookups race the shadow-page apply and the index publication on the paired-read lock.
+    void checkLookupsLoopingAcrossCheckpoint() {
+        std::atomic<bool> stop{false};
+        std::atomic<bool> checkpointRunning{false};
+        std::atomic<size_t> numLookups{0};
+        std::atomic<size_t> numLookupsDuringCheckpoint{0};
+        std::atomic<size_t> numWrong{0};
+        std::thread reader([&]() {
+            main::Connection readConn{database.get()};
+            for (int64_t i = 0; !stop.load(); ++i) {
+                const auto offset = i % numKeysToCheck;
+                const auto key = i % 2 == 0 ? offset : numInitialRows + offset;
+                const bool duringCheckpoint = checkpointRunning.load();
+                if (!lookupIsCorrect(readConn, key)) {
+                    ++numWrong;
+                }
+                ++numLookups;
+                if (duringCheckpoint && checkpointRunning.load()) {
+                    ++numLookupsDuringCheckpoint;
+                }
+            }
+        });
+        while (numLookups.load() == 0) {
+            std::this_thread::yield();
+        }
+        checkpointRunning = true;
+        auto result = conn->query("CHECKPOINT;");
+        checkpointRunning = false;
+        const auto lookupsAtCheckpointEnd = numLookups.load();
+        while (numLookups.load() < lookupsAtCheckpointEnd + 100) {
+            std::this_thread::yield();
+        }
+        stop = true;
+        reader.join();
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        EXPECT_GT(numLookupsDuringCheckpoint.load(), 0u) << "no lookup overlapped the checkpoint";
+        EXPECT_EQ(numWrong.load(), 0u) << "of " << numLookups.load() << " lookups";
+    }
+
+private:
+    bool stringKeys = false;
+};
+
+TEST_F(CheckpointShadowWindowTest, Int64PrimaryKeyLookupRightAfterShadowApply) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("INT64");
+    checkLookupsRightAfterShadowApply();
+}
+
+TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupRightAfterShadowApply) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("STRING");
+    checkLookupsRightAfterShadowApply();
+}
+
+TEST_F(CheckpointShadowWindowTest, PrimaryKeyLookupsLoopingAcrossCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("INT64");
+    checkLookupsLoopingAcrossCheckpoint();
+}
+
+// Partition children have their own storage managers and shadow files. Their staged index
+// state must be published together with their pages, like the main database's.
+TEST_F(CheckpointShadowWindowTest, PartitionChildLookupRightAfterShadowApply) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("INT64", " PARTITION BY HASH(id) PARTITIONS 2");
+    checkLookupsRightAfterShadowApply();
+}
+
+TEST_F(CheckpointShadowWindowTest, PartitionChildLookupsLoopingAcrossCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("INT64", " PARTITION BY HASH(id) PARTITIONS 2");
+    checkLookupsLoopingAcrossCheckpoint();
+}
+
+// After a reopen, a child's first batch is only in its on-disk index. A child that never
+// published its checkpoint kept the read headers it loaded at open over the slot pages the
+// checkpoint rewrote, until the next reopen.
+TEST_F(CheckpointShadowWindowTest, PartitionChildLookupsAfterCheckpointFollowingReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    setUpGrowth("INT64", " PARTITION BY HASH(id) PARTITIONS 2", true /* reopenBeforeGrowth */);
+    {
+        auto result = conn->query("CHECKPOINT;");
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    EXPECT_EQ(wrongLookups(), (std::array<size_t, 2>{})) << "after checkpoint";
+    createDBAndConn();
+    EXPECT_EQ(wrongLookups(), (std::array<size_t, 2>{})) << "after reopen";
+}
+#endif // __SINGLE_THREADED__
+
 // Read-only transactions are not blocked by a checkpoint, so a checkpoint can run between two
 // vectors of the same table scan. It merges the node group's chunked groups into a single
 // persistent one and rewrites its column chunk metadata, while the scan state still holds the
@@ -5300,16 +6291,8 @@ protected:
 
 // Fix #1 – lastTimestamp data race
 // ─────────────────────────────────────────────────────────────────────────────
-// Before the fix, checkpointNoLock() read `lastTimestamp` without holding
-// mtxForSerializingPublicFunctionCalls, which is UB when commit() concurrently
-// increments it.  The fix snapshots the value under the mutex.
-//
-// Observable invariant tested here: a write transaction committed while the
-// checkpoint drain is waiting for it must be included in the checkpoint.
-// Without the fix the snapshot could see a stale (too-low) lastTimestamp,
-// causing the MVCC catalog snapshot to exclude the final committed entry.
-// After the fix the snapshot is taken under the mutex *after* the drain, so
-// it is guaranteed to reflect all commits that happened before the gate.
+// A write transaction committed while the checkpoint drain is waiting for it must be included in
+// the checkpoint: the snapshot timestamp is read only after the drain.
 TEST_F(ReviewFixesTest, CheckpointDrainWaitsForInFlightWrite) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
@@ -5357,13 +6340,13 @@ TEST_F(ReviewFixesTest, CheckpointDrainWaitsForInFlightWrite) {
     conn2.reset();
 
     // On reload only checkpointed data is present (WAL has been rotated/cleared).
-    // All N+1 rows must be visible because the final commit occurred before the
-    // write gate was acquired and snapshotTS must capture it.
+    // All N+1 rows must be visible because the final commit landed during the drain, and the
+    // snapshot timestamp is read after the drain sees it.
     createDBAndConn();
     auto res = conn->query("MATCH (n:drain_test) RETURN count(n) AS c;");
     ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
     const auto count = res->getNext()->getValue(0)->getValue<int64_t>();
-    ASSERT_EQ(count, N + 1) << "Row committed just before the write gate must survive checkpoint";
+    ASSERT_EQ(count, N + 1) << "Row committed during the checkpoint drain must survive checkpoint";
 }
 
 TEST_F(ReviewFixesTest, CheckpointUsesMatchingCatalogForMainAndDefaultGraph) {
@@ -6129,6 +7112,27 @@ TEST_F(PinnedCheckpointCrashTest, LeftoverShadowKeepsCommitsAfterPinnedCheckpoin
     EXPECT_EQ(ids(), (std::vector<int64_t>{1, 2, 3, 4, 5}));
 }
 
+// A COMMIT that a later ABORT undoes still shows that the pinned checkpoint before it finished:
+// its writer got past the write gate after the CHECKPOINT record. Recovery skips through that
+// record despite the next checkpoint's leftover shadow, and the ABORT keeps the transaction out.
+// The ABORT is appended after the crash, where a failed publish would have logged it.
+TEST_F(PinnedCheckpointCrashTest, AbortedCommitAfterPinnedCheckpointIsSkipped) {
+    query("CREATE NODE TABLE P(id INT64 PRIMARY KEY);");
+    query("CHECKPOINT;");
+    createRows(1, 3);
+    pinWAL();
+    query("CHECKPOINT;");
+    const auto abortedStart =
+        std::filesystem::file_size(StorageUtils::getWALFilePath(databasePath));
+    createRows(4, 5);
+    failCheckpoint<FlakyCheckpointerKilledAfterCheckpointStorage>();
+    ASSERT_TRUE(std::filesystem::exists(shadowPath()));
+    crash();
+    appendToWAL(AbortRecord{abortedStart});
+    createDBAndConn();
+    EXPECT_EQ(ids(), (std::vector<int64_t>{1, 2, 3}));
+}
+
 TEST_F(PinnedCheckpointCrashTest, LeftoverShadowKeepsTableCreatedBeforePinnedCheckpoint) {
     query("CREATE NODE TABLE P(id INT64 PRIMARY KEY);");
     createRows(1, 3);
@@ -6676,6 +7680,31 @@ TEST_F(ReviewFixesTest, HashIndexBasicRecoveryAfterCheckpoint) {
         EXPECT_EQ(r->getNext()->getValue(0)->getValue<std::string>(), "v" + std::to_string(i));
         EXPECT_FALSE(r->hasNext());
     }
+}
+
+TEST_F(ReviewFixesTest, OptimisticRollbackFreesOnlyUnretainedPages) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    auto* file = getStorageManager(*database)->getDataFH();
+    // A fresh page manager gives two adjacent allocations independent of the DB's free list.
+    PageManager pages{file};
+    OptimisticAllocator allocator{pages};
+    const auto start = allocator.allocatePageRange(8).startPageIdx;
+    ASSERT_EQ(allocator.allocatePageRange(4).startPageIdx, start + 8);
+    allocator.retainPageRange({start + 2, 2}); // splits the first allocation
+    allocator.retainPageRange({start + 6, 4}); // spans both allocations
+    allocator.retainPageRange({start + 2, 2}); // already retained
+    allocator.retainPageRange({start, 0});
+    allocator.rollback();
+    std::vector<std::pair<page_idx_t, page_idx_t>> freed;
+    for (const auto& range : pages.getFreeEntries(0, pages.getNumFreeEntries())) {
+        freed.emplace_back(range.startPageIdx, range.numPages);
+    }
+    std::sort(freed.begin(), freed.end());
+    const std::vector<std::pair<page_idx_t, page_idx_t>> expected{{start, 2}, {start + 4, 2},
+        {start + 10, 2}};
+    EXPECT_EQ(freed, expected);
 }
 
 // Fix #5 – reclaimTailPagesIfNeeded must not introduce overlap with existing FSM entries
@@ -8332,6 +9361,186 @@ TEST_F(FailedCheckpointPKIndexTest, StringLookupsSurviveFailedCheckpoint) {
     checkPointLookups(keyOf, 0, 140, "after reopen");
 }
 
+// These retry right after the failed checkpoint. The tests above insert duplicates first, whose
+// rollback makes the retry rewrite the metadata, which hides the skip.
+TEST_F(FailedCheckpointPKIndexTest, FirstIndexCheckpointSurvivesFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    checkpoint();
+    // The index's first keys: it has no header page on disk yet.
+    for (auto i = 0; i < 100; i++) {
+        ASSERT_TRUE(
+            conn->query(std::format("CREATE (:test {{id: {}, v: {}}});", i, i))->isSuccess());
+    }
+    failCheckpointOnSerialization();
+    checkpoint();
+    createDBAndConn();
+    checkCount(100);
+    checkPointLookups([](int64_t k) { return std::to_string(k); }, 0, 100, "after reopen");
+    EXPECT_FALSE(conn->query("CREATE (:test {id: 10, v: -1});")->isSuccess());
+    checkCount(100);
+}
+
+TEST_F(FailedCheckpointPKIndexTest, RetryWithoutWritesKeepsKeysOnce) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    for (auto i = 0; i < 300; i++) {
+        ASSERT_TRUE(
+            conn->query(std::format("CREATE (:test {{id: {}, v: {}}});", i, i))->isSuccess());
+    }
+    checkpoint();
+    for (auto i = 300; i < 400; i++) {
+        ASSERT_TRUE(
+            conn->query(std::format("CREATE (:test {{id: {}, v: {}}});", i, i))->isSuccess());
+    }
+    failCheckpointOnSerialization();
+    checkpoint();
+    createDBAndConn();
+    checkCount(400);
+    checkPointLookups([](int64_t k) { return std::to_string(k); }, 0, 400, "after reopen");
+    // Each key is in the index once: deleting one leaves nothing to find, and it can be added
+    // again.
+    ASSERT_TRUE(conn->query("MATCH (t:test {id: 350}) DELETE t;")->isSuccess());
+    auto res = conn->query("MATCH (t:test) WHERE t.id = 350 RETURN t.id;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    EXPECT_FALSE(res->hasNext());
+    EXPECT_TRUE(conn->query("CREATE (:test {id: 350, v: -1});")->isSuccess());
+    EXPECT_FALSE(conn->query("CREATE (:test {id: 10, v: -1});")->isSuccess());
+    checkCount(400);
+}
+
+TEST_F(FailedCheckpointPKIndexTest, RelChangesSurviveFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE knows(FROM test TO test);")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 9) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    checkpoint();
+    // Only the rel table changes before the failed checkpoint.
+    ASSERT_TRUE(conn->query("MATCH (a:test), (b:test) WHERE b.id = a.id + 1 "
+                            "CREATE (a)-[:knows]->(b);")
+                    ->isSuccess());
+    failCheckpointOnSerialization();
+    checkpoint();
+    createDBAndConn();
+    auto res = conn->query("MATCH (:test)-[k:knows]->(:test) RETURN COUNT(k);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    EXPECT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 9);
+}
+
+// Enough keys for the failed checkpoint to add overflow slots: the retry must merge the keys into
+// the slot pages as they were before it, not into its shadow pages.
+TEST_F(FailedCheckpointPKIndexTest, RetryMergesKeysIntoSlotsOnce) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("UNWIND range(0, 299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    checkpoint();
+    ASSERT_TRUE(
+        conn->query("UNWIND range(300, 30299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    failCheckpointOnSerialization();
+    checkpoint();
+    createDBAndConn();
+    checkCount(30300);
+    const auto keyOf = [](int64_t k) { return std::to_string(k); };
+    checkPointLookups(keyOf, 0, 400, "after reopen");
+    checkPointLookups(keyOf, 30000, 30300, "after reopen");
+    EXPECT_FALSE(conn->query("CREATE (:test {id: 15000, v: -1});")->isSuccess());
+}
+
+// The same with a write before the retry, which makes the retry checkpoint the table on main too.
+TEST_F(FailedCheckpointPKIndexTest, RetryAfterAWriteMergesKeysIntoSlotsOnce) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("UNWIND range(0, 299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    checkpoint();
+    ASSERT_TRUE(
+        conn->query("UNWIND range(300, 30299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    failCheckpointOnSerialization();
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 40000, v: 0});")->isSuccess());
+    checkpoint();
+    createDBAndConn();
+    checkCount(30301);
+    const auto keyOf = [](int64_t k) { return std::to_string(k); };
+    checkPointLookups(keyOf, 30000, 30300, "after reopen");
+    checkPointLookups(keyOf, 40000, 40001, "after reopen");
+    EXPECT_FALSE(conn->query("CREATE (:test {id: 15000, v: -1});")->isSuccess());
+}
+
+// The checkpoint fails in the second table, after the first one is done. The retry also applies
+// the failed attempt's shadow page of the in-place update, which the rollback keeps, so this
+// passes without the epoch restore too; the tests above fail without it.
+TEST_F(FailedCheckpointPKIndexTest, FailureInALaterTableKeepsTheEarlierTablesChanges) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE a(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE b(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 299) AS i CREATE (:a {id: i, v: i});")->isSuccess());
+    checkpoint();
+    // Updated in place, so the checkpoint of `a` allocates no pages; the new rows of `b` do.
+    ASSERT_TRUE(conn->query("MATCH (x:a) WHERE x.id = 7 SET x.v = 5;")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 99) AS i CREATE (:b {id: i, v: i});")->isSuccess());
+    auto context = getClientContext(*conn);
+    bool failed = false;
+    FlakyCheckpointer flakyCheckpointer([&failed](main::ClientContext& ctx) {
+        return std::make_unique<FlakyCheckpointerFailsDuringOutOfPlaceRewrite>(ctx, failed);
+    });
+    flakyCheckpointer.setCheckpointer(*context);
+    ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+    FlakyCheckpointer::resetCheckpointer(*context);
+    ASSERT_TRUE(failed);
+    checkpoint();
+    createDBAndConn();
+    auto res = conn->query("MATCH (x:a) WHERE x.id = 7 RETURN x.v;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    ASSERT_TRUE(res->hasNext());
+    EXPECT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 5);
+    res = conn->query("MATCH (x:b) RETURN COUNT(*);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    EXPECT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), 100);
+}
+
+// The failed checkpoint adds slot pages to the index, and its rollback must drop their shadow
+// copies with those of the pages that were already there.
+TEST_F(FailedCheckpointPKIndexTest, RollbackDropsShadowsOfAddedSlotPages) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, v INT64);")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("UNWIND range(0, 299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    checkpoint();
+    auto* storageManager = getClientContext(*conn)->getDatabase()->getStorageManager();
+    const auto* dataFH = storageManager->getDataFH();
+    const auto numPagesBefore = dataFH->getNumPages();
+    ASSERT_TRUE(
+        conn->query("UNWIND range(300, 30299) AS i CREATE (:test {id: i, v: i});")->isSuccess());
+    failCheckpointOnSerialization();
+    ASSERT_GT(dataFH->getNumPages(), numPagesBefore);
+    auto numShadowedNewPages = 0u;
+    for (auto pageIdx = numPagesBefore; pageIdx < dataFH->getNumPages(); pageIdx++) {
+        if (storageManager->getShadowFile().hasShadowPage(dataFH->getFileIndex(), pageIdx)) {
+            numShadowedNewPages++;
+        }
+    }
+    EXPECT_EQ(numShadowedNewPages, 0u);
+    checkpoint();
+    createDBAndConn();
+    checkCount(30300);
+    checkPointLookups([](int64_t k) { return std::to_string(k); }, 30000, 30300, "after reopen");
+}
+
 // A rel scan that is already in progress keeps the CSR header, persistent group, in-memory
 // groups, and CSR index it started with. A checkpoint may replace those while the scan runs.
 #ifndef __SINGLE_THREADED__
@@ -9246,6 +10455,28 @@ TEST_F(PartitionCrashRecoveryTest, UUIDListKeysSurviveWALReplay) {
     EXPECT_EQ(newPlan->toString().find("U_p1"), std::string::npos);
 }
 
+TEST_F(PartitionCrashRecoveryTest, DayRangeSurvivesWALReplay) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runQuery("CREATE NODE TABLE D(id INT64 PRIMARY KEY, k DATE) "
+             "PARTITION BY RANGE(k) INTERVAL '1 day'");
+    runQuery("CREATE (:D {id:1,k:DATE('2026-11-22')})");
+    runQuery("CREATE (:D {id:2,k:DATE('1969-12-31')})");
+    crashAndReopen();
+    EXPECT_EQ(scanIDs("MATCH(n:D) WHERE n.k<DATE('1970-01-01') RETURN n.id"),
+        std::vector<int64_t>{2});
+    runQuery("CREATE (:D {id:3,k:DATE('1969-12-31')})");
+    runQuery("CREATE (:D {id:4,k:DATE('2026-11-23')})");
+    EXPECT_EQ(scanIDs("MATCH(n:D_p1) RETURN n.id ORDER BY n.id"), (std::vector<int64_t>{2, 3}));
+    EXPECT_EQ(scanIDs("MATCH(n:D_p2) RETURN n.id"), std::vector<int64_t>{4});
+    auto plan = conn->query("EXPLAIN MATCH(n:D) WHERE n.k<DATE('1970-01-01') RETURN n.id");
+    ASSERT_TRUE(plan->isSuccess()) << plan->getErrorMessage();
+    EXPECT_NE(plan->toString().find("Tables: D_p1"), std::string::npos);
+    EXPECT_EQ(plan->toString().find("D_p0"), std::string::npos);
+    EXPECT_EQ(plan->toString().find("D_p2"), std::string::npos);
+}
+
 TEST_F(PartitionCrashRecoveryTest, HashParentSurvivesCrashRecovery) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
@@ -9265,6 +10496,314 @@ TEST_F(PartitionCrashRecoveryTest, HashParentSurvivesCrashRecovery) {
     ASSERT_TRUE(hashPlan->isSuccess()) << hashPlan->getErrorMessage();
     EXPECT_NE(hashPlan->toString().find("Tables: H_p0"), std::string::npos);
     EXPECT_EQ(hashPlan->toString().find("H_p1"), std::string::npos);
+}
+
+// Runs a checkpoint whose first page allocation fails, then checks that the committed data reads
+// back unchanged before any reopen, after a retry succeeds, and after reopening the database.
+class FailedInPlaceCheckpointTest : public FlakyCheckpointerTest {
+public:
+    std::vector<std::string> queryRows(const std::string& query) const {
+        auto res = conn->query(query);
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        std::vector<std::string> rows;
+        if (!res->isSuccess()) {
+            return rows;
+        }
+        while (res->hasNext()) {
+            auto row = res->getNext()->toString();
+            if (!row.empty() && row.back() == '\n') {
+                row.pop_back();
+            }
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+
+    void failFirstAllocationInCheckpoint() const {
+        auto context = getClientContext(*conn);
+        bool failed = false;
+        FlakyCheckpointer flakyCheckpointer([&failed](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsDuringOutOfPlaceRewrite>(ctx, failed);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        auto res = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        ASSERT_FALSE(res->isSuccess());
+        ASSERT_TRUE(failed);
+    }
+
+    void checkpoint() const {
+        auto res = conn->query("CHECKPOINT;");
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    }
+};
+
+// Fails the `failAt`-th page allocation (1-based) of a checkpoint and counts all allocations.
+class FailNthAllocationPageAllocator final : public PageAllocator {
+public:
+    FailNthAllocationPageAllocator(PageAllocator& inner, uint64_t failAt, uint64_t& numAllocations)
+        : PageAllocator(inner.getDataFH()), inner{inner}, failAt{failAt},
+          numAllocations{numAllocations} {}
+
+    PageRange allocatePageRange(page_idx_t numPages) override {
+        if (++numAllocations == failAt) {
+            throw RuntimeException("checkpoint failed.");
+        }
+        return inner.allocatePageRange(numPages);
+    }
+    void freePageRange(PageRange block) override { inner.freePageRange(block); }
+
+private:
+    PageAllocator& inner;
+    uint64_t failAt;
+    uint64_t& numAllocations;
+};
+
+// Runs the storage phase with the `failAt`-th page allocation failing. If fewer allocations
+// happen, the checkpoint still fails, after the storage phase of every table completed.
+class FlakyCheckpointerFailsOnNthAllocation final : public Checkpointer {
+public:
+    FlakyCheckpointerFailsOnNthAllocation(main::ClientContext& context, uint64_t failAt,
+        uint64_t& numAllocations)
+        : Checkpointer(context), failAt{failAt}, numAllocations{numAllocations} {}
+
+    bool checkpointStorage() override {
+        for (const auto& target : checkpointTargets) {
+            FailNthAllocationPageAllocator pageAllocator(
+                *target.storageManager->getDataFH()->getPageManager(), failAt, numAllocations);
+            const Transaction snapshotTxn(TransactionType::CHECKPOINT,
+                Transaction::DUMMY_TRANSACTION_ID, snapshotTS);
+            target.storageManager->checkpoint(&clientContext, *target.catalog, snapshotTxn,
+                pageAllocator, tableEpochWatermarksByManager.at(target.storageManager));
+        }
+        throw RuntimeException("checkpoint failed after the storage phase.");
+    }
+
+private:
+    uint64_t failAt;
+    uint64_t& numAllocations;
+};
+
+// Two failed checkpoints in a row. The first fails at allocation `k1`, possibly after one CSR
+// node group (e.g. the forward direction) completed and left its in-place rewrites in shadow
+// pages, which a failed checkpoint does not discard. The second, after another rel is added to
+// the same source node, fails at allocation `k2`, possibly inside that same node group after it
+// rewrote those shadow pages again. Every committed rel must read back exactly after each
+// failure, after a successful checkpoint and after reopening the database.
+TEST_F(FailedInPlaceCheckpointTest, RelsReadBackAfterTwoFailedCSRCheckpoints) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    constexpr int64_t numNodes = 1000;
+    auto failCheckpointAt = [&](uint64_t failAt) {
+        auto context = getClientContext(*conn);
+        uint64_t numAllocations = 0;
+        FlakyCheckpointer flakyCheckpointer([&](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsOnNthAllocation>(ctx, failAt,
+                numAllocations);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        auto res = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        EXPECT_FALSE(res->isSuccess());
+        return numAllocations;
+    };
+    struct Case {
+        std::string suffix;
+        std::vector<std::string> expected;
+    };
+    auto check = [&](const Case& c, const std::string& when) {
+        const auto fwd = queryRows(std::format("MATCH (a:n{0})-[r:e{0}]->(b:n{0}) RETURN a.id, "
+                                               "b.id, r.w ORDER BY a.id, b.id, r.w;",
+            c.suffix));
+        const auto bwd = queryRows(std::format("MATCH (b:n{0})<-[r:e{0}]-(a:n{0}) RETURN a.id, "
+                                               "b.id, r.w ORDER BY a.id, b.id, r.w;",
+            c.suffix));
+        auto describe = [&](const std::vector<std::string>& actual) {
+            std::vector<std::string> missing, extra;
+            auto sortedExpected = c.expected;
+            auto sortedActual = actual;
+            std::sort(sortedExpected.begin(), sortedExpected.end());
+            std::sort(sortedActual.begin(), sortedActual.end());
+            std::set_difference(sortedExpected.begin(), sortedExpected.end(), sortedActual.begin(),
+                sortedActual.end(), std::back_inserter(missing));
+            std::set_difference(sortedActual.begin(), sortedActual.end(), sortedExpected.begin(),
+                sortedExpected.end(), std::back_inserter(extra));
+            std::string out = std::format("{} rows, {} missing, {} unexpected;", actual.size(),
+                missing.size(), extra.size());
+            for (auto i = 0u; i < std::min<size_t>(missing.size(), 5); i++) {
+                out += " -" + missing[i];
+            }
+            for (auto i = 0u; i < std::min<size_t>(extra.size(), 5); i++) {
+                out += " +" + extra[i];
+            }
+            return out;
+        };
+        EXPECT_EQ(fwd, c.expected) << c.suffix << " forward, " << when << ": " << describe(fwd);
+        EXPECT_EQ(bwd, c.expected) << c.suffix << " backward, " << when << ": " << describe(bwd);
+    };
+    auto runQuery = [&](const std::string& query) {
+        auto res = conn->query(query);
+        ASSERT_TRUE(res->isSuccess()) << query << ": " << res->getErrorMessage();
+    };
+
+    // Sweeps both failure points until a checkpoint's storage phase completes without reaching
+    // the failing allocation (that last case fails after the storage phase).
+    bool firstReachedEnd = false;
+    for (uint64_t k1 = 1; !firstReachedEnd; k1++) {
+        bool secondReachedEnd = false;
+        for (uint64_t k2 = 1; !secondReachedEnd; k2++) {
+            Case c{std::format("_{}_{}", k1, k2), {}};
+            runQuery(std::format("CREATE NODE TABLE n{}(id INT64 PRIMARY KEY);", c.suffix));
+            runQuery(std::format("CREATE REL TABLE e{0}(FROM n{0} TO n{0}, w INT64);", c.suffix));
+            runQuery(std::format("UNWIND range(0, {}) AS i CREATE (:n{} {{id: i}});", numNodes - 1,
+                c.suffix));
+            runQuery(std::format("MATCH (a:n{0}), (b:n{0}) WHERE b.id = (a.id + 1) % {1} "
+                                 "CREATE (a)-[:e{0} {{w: a.id}}]->(b);",
+                c.suffix, numNodes));
+            runQuery("CHECKPOINT;");
+            for (int64_t i = 0; i < numNodes; i++) {
+                c.expected.push_back(std::format("{}|{}|{}", i, (i + 1) % numNodes, i));
+            }
+            auto addRel = [&](int64_t dst, int64_t w) {
+                runQuery(std::format("MATCH (a:n{0} {{id: 0}}), (b:n{0} {{id: {1}}}) CREATE "
+                                     "(a)-[:e{0} {{w: {2}}}]->(b);",
+                    c.suffix, dst, w));
+                c.expected.push_back(std::format("0|{}|{}", dst, w));
+                std::sort(c.expected.begin(), c.expected.end(), [](const auto& x, const auto& y) {
+                    auto key = [](const std::string& row) {
+                        std::vector<int64_t> v;
+                        size_t start = 0;
+                        for (size_t pos; (pos = row.find('|', start)) != std::string::npos;
+                             start = pos + 1) {
+                            v.push_back(std::stoll(row.substr(start, pos - start)));
+                        }
+                        v.push_back(std::stoll(row.substr(start)));
+                        return v;
+                    };
+                    return key(x) < key(y);
+                });
+            };
+            addRel(500, 7);
+            const auto first = failCheckpointAt(k1);
+            firstReachedEnd = first < k1;
+            check(c,
+                std::format("after the first failed checkpoint (allocation {} of {})", k1, first));
+            addRel(600, 8);
+            const auto second = failCheckpointAt(k2);
+            secondReachedEnd = second < k2;
+            check(c, std::format("after the second failed checkpoint (allocations {} of {}, "
+                                 "then {} of {})",
+                         k1, first, k2, second));
+            runQuery("CHECKPOINT;");
+            check(c, "after a successful checkpoint");
+            createDBAndConn();
+            runQuery("CALL force_checkpoint_on_close=false;");
+            runQuery("CALL auto_checkpoint=false;");
+            check(c, "after reopening");
+            // Keep only one pair of tables at a time, so the sweep stays within the buffer pool.
+            runQuery(std::format("DROP TABLE e{};", c.suffix));
+            runQuery(std::format("DROP TABLE n{};", c.suffix));
+            runQuery("CHECKPOINT;");
+        }
+    }
+}
+
+// Minimal form of the sweep above. The first checkpoint fails after its storage phase, so every
+// CSR node group completed and left its in-place rewrites in shadow pages, which the failed
+// checkpoint keeps. After another rel is added to node 0, the second checkpoint fails at its
+// first page allocation, inside the forward CSR node group after its data columns were rewritten
+// in place into those same shadow pages. Restoring the group's pre-checkpoint chunks and dropping
+// the shadow pages created since its savepoint does not undo writes to shadow pages that already
+// existed.
+TEST_F(FailedInPlaceCheckpointTest, RelsReadBackAfterFailedCSRCheckpointFollowingFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE n(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE e(FROM n TO n, w INT64);")->isSuccess());
+    constexpr int64_t numNodes = 1000;
+    ASSERT_TRUE(
+        conn->query(std::format("UNWIND range(0, {}) AS i CREATE (:n {{id: i}});", numNodes - 1))
+            ->isSuccess());
+    auto res = conn->query(std::format(
+        "MATCH (a:n), (b:n) WHERE b.id = (a.id + 1) % {} CREATE (a)-[:e {{w: a.id}}]->(b);",
+        numNodes));
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    checkpoint();
+
+    std::vector<std::string> expected;
+    for (int64_t i = 0; i < numNodes; i++) {
+        expected.push_back(std::format("{}|{}|{}", i, (i + 1) % numNodes, i));
+        if (i == 0) {
+            expected.push_back("0|500|7");
+            expected.push_back("0|600|8");
+        }
+    }
+    const std::string fwdQuery =
+        "MATCH (a:n)-[r:e]->(b:n) RETURN a.id, b.id, r.w ORDER BY a.id, b.id, r.w;";
+    const std::string bwdQuery =
+        "MATCH (b:n)<-[r:e]-(a:n) RETURN a.id, b.id, r.w ORDER BY a.id, b.id, r.w;";
+    auto check = [&](const std::string& when) {
+        const auto fwd = queryRows(fwdQuery);
+        const auto bwd = queryRows(bwdQuery);
+        EXPECT_EQ(fwd, expected) << "forward, " << when;
+        EXPECT_EQ(bwd, expected) << "backward, " << when;
+        for (auto i = 0u; i < std::min(fwd.size(), expected.size()); i++) {
+            if (fwd[i] != expected[i]) {
+                ADD_FAILURE() << "forward, " << when << ": first wrong row " << i << ": got "
+                              << fwd[i] << ", expected " << expected[i];
+                break;
+            }
+        }
+    };
+
+    res = conn->query("MATCH (a:n {id: 0}), (b:n {id: 500}) CREATE (a)-[:e {w: 7}]->(b);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    auto context = getClientContext(*conn);
+    {
+        FlakyCheckpointer flakyCheckpointer([](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsOnSerialization>(ctx);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+        FlakyCheckpointer::resetCheckpointer(*context);
+    }
+    res = conn->query("MATCH (a:n {id: 0}), (b:n {id: 600}) CREATE (a)-[:e {w: 8}]->(b);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    failFirstAllocationInCheckpoint();
+    check("after the second failed checkpoint");
+    checkpoint();
+    check("after a successful checkpoint");
+    // Query results must not outlive the database they were read from.
+    res.reset();
+    createDBAndConn();
+    check("after reopening");
+}
+
+// Rolling back to a savepoint that is not the active one would drop shadow pages of groups that
+// completed, so it is refused in release builds too.
+TEST_F(FailedInPlaceCheckpointTest, ShadowSavepointRollbackRequiresTheActiveSavepoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto& shadowFile = getStorageManager(*database)->getShadowFile();
+    EXPECT_THROW(shadowFile.rollbackToSavepoint(0), InternalException);
+    const auto savepoint = shadowFile.createSavepoint();
+    EXPECT_THROW(shadowFile.rollbackToSavepoint(savepoint + 1), InternalException);
+    // A refused rollback leaves the savepoint active.
+    EXPECT_NO_THROW(shadowFile.rollbackToSavepoint(savepoint));
+    // After the rollback no savepoint is active, so a new one can be taken and released.
+    EXPECT_THROW(shadowFile.rollbackToSavepoint(savepoint), InternalException);
+    shadowFile.createSavepoint();
+    // Only one savepoint can be active: a second would discard the first group's saved pages.
+    EXPECT_THROW(shadowFile.createSavepoint(), InternalException);
+    shadowFile.releaseSavepoint();
+    EXPECT_FALSE(shadowFile.hasFailedSavepointRollback());
 }
 
 } // namespace testing

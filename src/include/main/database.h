@@ -197,6 +197,7 @@ private:
         construct_bm_func_t constructBMFunc);
 
     void validatePathInReadOnly() const;
+    void releaseMembersBeforeOpenPathClaim();
 
 private:
     // EXTENSION ABI: extensions ship once per minor version and must keep working with
@@ -222,6 +223,11 @@ private:
     std::vector<std::unique_ptr<extension::BinderExtension>> binderExtensions;
     std::vector<std::unique_ptr<extension::PlannerExtension>> plannerExtensions;
     std::vector<std::unique_ptr<extension::MapperExtension>> mapperExtensions;
+    // In-process guard for nodejs#29: tracks file-backed read-write opens so a second
+    // Database on the same path in the same process is rejected (fcntl locks are
+    // per-process on POSIX and would otherwise allow it, letting close-time
+    // checkpoint steal the new DB's WAL). Appended at END per ABI rule above.
+    bool ownsOpenPathClaim = false;
 };
 
 } // namespace main

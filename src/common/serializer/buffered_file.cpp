@@ -1,6 +1,8 @@
 #include "common/serializer/buffered_file.h"
 
+#include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/exception/runtime.h"
@@ -18,7 +20,12 @@ BufferedFileWriter::BufferedFileWriter(FileInfo& fileInfo)
       fileInfo(fileInfo) {}
 
 BufferedFileWriter::~BufferedFileWriter() {
-    flush();
+    // A destructor cannot report a failed write; writers whose bytes must reach the file flush
+    // them first.
+    try {
+        flush();
+    } catch (...) { // NOLINT(bugprone-empty-catch): see above.
+    }
 }
 
 void BufferedFileWriter::write(const uint8_t* data, uint64_t size) {
@@ -52,10 +59,11 @@ void BufferedFileWriter::flush() {
     if (bufferOffset == 0) {
         return;
     }
-    fileInfo.writeFile(buffer.get(), bufferOffset, fileOffset);
-    fileOffset += bufferOffset;
-    bufferOffset = 0;
-    memset(buffer.get(), 0, BUFFER_SIZE);
+    // The bytes leave the buffer even when the write fails: neither a later flush nor the
+    // destructor may write them after the caller has seen the failure.
+    const auto size = std::exchange(bufferOffset, 0);
+    fileInfo.writeFile(buffer.get(), size, fileOffset);
+    fileOffset += size;
 }
 
 void BufferedFileWriter::sync() {
@@ -78,20 +86,31 @@ void BufferedFileReader::read(uint8_t* data, uint64_t size) {
         // Clear read buffer.
         fileOffset -= bufferSize;
         fileOffset += bufferOffset;
+        bufferOffset = 0;
+        bufferSize = 0;
+        // readFromFile silently short-reads at EOF, so check the range first and throw a
+        // catchable error instead of returning uninitialized bytes. A torn WAL tail (e.g. a
+        // crash or ENOSPC mid-commit) must surface as a replay failure, not a native crash.
+        if (fileOffset > fileSize || size > fileSize - fileOffset) {
+            throw RuntimeException(
+                std::format("Reading past the end of the file {} with size {} at offset {}",
+                    fileInfo.path, fileSize, fileOffset));
+        }
         fileInfo.readFromFile(data, size, fileOffset);
         fileOffset += size;
-        bufferOffset = bufferSize;
-    } else if (bufferOffset + size <= bufferSize) {
-        memcpy(data, &buffer[bufferOffset], size);
-        bufferOffset += size;
     } else {
-        auto toCopy = bufferSize - bufferOffset;
-        memcpy(data, &buffer[bufferOffset], toCopy);
-        bufferOffset += toCopy;
-        readNextPage();
-        auto remaining = size - toCopy;
-        memcpy(data + toCopy, buffer.get(), remaining);
-        bufferOffset += remaining;
+        // Loop across page boundaries: the final page of a torn file may hold fewer bytes
+        // than requested, and copying the full remainder would overrun the heap buffer.
+        while (size > 0) {
+            if (bufferOffset >= bufferSize) {
+                readNextPage();
+            }
+            const auto toCopy = std::min(size, bufferSize - bufferOffset);
+            memcpy(data, &buffer[bufferOffset], toCopy);
+            bufferOffset += toCopy;
+            data += toCopy;
+            size -= toCopy;
+        }
     }
 }
 

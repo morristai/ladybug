@@ -1,14 +1,19 @@
+#include <algorithm>
 #include <optional>
 
 #include "binder/binder.h"
+#include "binder/bound_standalone_call_function.h"
 #include "binder/ddl/bound_alter.h"
+#include "binder/ddl/bound_create_constraint.h"
 #include "binder/ddl/bound_create_index.h"
 #include "binder/ddl/bound_create_sequence.h"
 #include "binder/ddl/bound_create_table.h"
 #include "binder/ddl/bound_create_type.h"
 #include "binder/ddl/bound_drop.h"
+#include "binder/ddl/bound_drop_constraint.h"
 #include "binder/expression_visitor.h"
 #include "catalog/catalog.h"
+#include "catalog/catalog_entry/constraint_catalog_entry.h"
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
@@ -21,18 +26,24 @@
 #include "common/string_utils.h"
 #include "common/system_config.h"
 #include "common/types/types.h"
+#include "function/arithmetic/vector_arithmetic_functions.h"
 #include "function/cast/functions/cast_from_string_functions.h"
 #include "function/sequence/sequence_functions.h"
+#include "function/table/simple_table_function.h"
 #include "function/table/table_function.h"
 #include "main/client_context.h"
 #include "main/database_manager.h"
 #include "parser/ddl/alter.h"
+#include "parser/ddl/create_constraint.h"
 #include "parser/ddl/create_index.h"
 #include "parser/ddl/create_sequence.h"
 #include "parser/ddl/create_table.h"
 #include "parser/ddl/create_table_info.h"
 #include "parser/ddl/create_type.h"
 #include "parser/ddl/drop.h"
+#include "parser/ddl/drop_constraint.h"
+#include "parser/ddl/show_constraints.h"
+#include "parser/expression/parsed_expression_visitor.h"
 #include "parser/expression/parsed_function_expression.h"
 #include "parser/expression/parsed_literal_expression.h"
 #include "storage/index/art_index.h"
@@ -95,6 +106,24 @@ std::vector<PropertyDefinition> Binder::bindPropertyDefinitions(
     return definitions;
 }
 
+namespace {
+// A DEFAULT is evaluated for every inserted row, and the default evaluator handles nextval as its
+// only side-effecting function, so setval and setseed are refused there.
+class StatefulFunctionFinder final : public ParsedExpressionVisitor {
+public:
+    std::string found;
+
+    void visitFunctionExpr(const ParsedExpression* expr) override {
+        const auto& functionName = expr->constCast<ParsedFunctionExpression>().getFunctionName();
+        auto upperName = StringUtils::getUpper(functionName);
+        if (upperName == function::SetValFunction::name ||
+            upperName == function::SetSeedFunction::name) {
+            found = StringUtils::getLower(functionName);
+        }
+    }
+};
+} // namespace
+
 std::unique_ptr<ParsedExpression> Binder::resolvePropertyDefault(ParsedExpression* parsedDefault,
     const LogicalType& type, const std::string& tableName, const std::string& propertyName) {
     if (parsedDefault == nullptr) { // No default provided.
@@ -109,6 +138,11 @@ std::unique_ptr<ParsedExpression> Binder::resolvePropertyDefault(ParsedExpressio
     } else {
         if (type.getLogicalTypeID() == LogicalTypeID::SERIAL) {
             throw BinderException("No DEFAULT value should be set for SERIAL columns");
+        }
+        StatefulFunctionFinder finder;
+        finder.visit(parsedDefault);
+        if (!finder.found.empty()) {
+            throw BinderException(finder.found + " is not allowed in a DEFAULT expression.");
         }
         return parsedDefault->copy();
     }
@@ -216,7 +250,7 @@ static ParsedStorageFormat getStorageFormat(const case_insensitive_map_t<Value>&
 }
 
 static void validatePartitionColumn(const std::vector<PropertyDefinition>& propertyDefinitions,
-    const std::string& columnName) {
+    const std::string& columnName, BoundPartitionMethod method) {
     auto propertyIt = std::find_if(propertyDefinitions.begin(), propertyDefinitions.end(),
         [&](const PropertyDefinition& def) { return def.getName() == columnName; });
     if (propertyIt == propertyDefinitions.end()) {
@@ -225,11 +259,31 @@ static void validatePartitionColumn(const std::vector<PropertyDefinition>& prope
             "of the table.",
             columnName));
     }
-    if (!LogicalTypeUtils::isPartitionable(propertyIt->getType())) {
+    const auto type = propertyIt->getType().getLogicalTypeID();
+    if (method == BoundPartitionMethod::RANGE_DAY) {
+        if (type != LogicalTypeID::DATE && type != LogicalTypeID::TIMESTAMP_TZ &&
+            !LogicalTypeUtils::isTimestamp(type)) {
+            throw BinderException(std::format(
+                "Daily RANGE partition column {} must have a DATE or TIMESTAMP type.", columnName));
+        }
+        return;
+    }
+    if (!LogicalTypeUtils::isPartitionable(type)) {
         throw BinderException(std::format(
             "Partition column {} has type {} which is not eligible for partitioning. Partition "
             "columns must be an integral, temporal or textual type.",
             columnName, propertyIt->getType().toString()));
+    }
+}
+
+static void validateDailyRangeRelEndpoint(TableCatalogEntry* entry) {
+    if (entry->getType() == CatalogEntryType::NODE_TABLE_ENTRY &&
+        entry->constCast<NodeTableCatalogEntry>().getPartitionMethod() ==
+            BoundPartitionMethod::RANGE_DAY) {
+        throw BinderException(
+            std::format("Daily RANGE parent {} cannot be a relationship endpoint yet. "
+                        "Use a materialized child table as the endpoint.",
+                entry->getName()));
     }
 }
 
@@ -268,33 +322,30 @@ BoundCreateTableInfo Binder::bindCreateNodeTableInfo(const CreateTableInfo* info
         BoundPartitionMethod method;
         switch (parsed.method) {
         case ParsedPartitionMethod::HASH:
-            method = BoundPartitionMethod::HASH;
-            break;
-        case ParsedPartitionMethod::LIST:
-            // LIST partitions dynamically: one partition per distinct key value, created on
-            // demand. It takes no PARTITIONS clause.
-            method = BoundPartitionMethod::LIST;
-            validatePartitionColumn(propertyDefinitions, parsed.columnName);
-            partitionInfo = BoundPartitionInfo(method, parsed.columnName, 0 /* numPartitions */);
-            break;
-            // Real range partitioning must split on the actual distribution of values (equal
-            // domain splits would dump all real-world data into one bucket). Until that dynamic
-            // splitting exists, refuse the DDL rather than silently falling back to hash routing.
-        case ParsedPartitionMethod::RANGE:
-            throw BinderException(
-                "RANGE partitioning is not implemented yet. RANGE requires partition bounds "
-                "derived from the actual value distribution, which is future work. Use PARTITION "
-                "BY HASH instead.");
-        default:
-            UNREACHABLE_CODE;
-        }
-        if (method == BoundPartitionMethod::HASH) {
             if (parsed.numPartitions == 0) {
                 throw BinderException("Number of partitions must be greater than 0.");
             }
-            validatePartitionColumn(propertyDefinitions, parsed.columnName);
-            partitionInfo = BoundPartitionInfo(method, parsed.columnName, parsed.numPartitions);
+            method = BoundPartitionMethod::HASH;
+            break;
+        case ParsedPartitionMethod::LIST:
+            method = BoundPartitionMethod::LIST;
+            break;
+        case ParsedPartitionMethod::RANGE_DAY:
+            if (!storage.empty() || storageFormat != StorageFormat::NONE) {
+                throw BinderException(
+                    "Daily RANGE partitioning requires native node table storage.");
+            }
+            method = BoundPartitionMethod::RANGE_DAY;
+            break;
+        case ParsedPartitionMethod::RANGE:
+            throw BinderException(
+                "RANGE with PARTITIONS does not define partition bounds. "
+                "Use PARTITION BY RANGE (column) INTERVAL '1 day' for daily partitions.");
+        default:
+            UNREACHABLE_CODE;
         }
+        validatePartitionColumn(propertyDefinitions, parsed.columnName, method);
+        partitionInfo.emplace(method, parsed.columnName, parsed.numPartitions);
     }
     auto boundExtraInfo = std::make_unique<BoundExtraCreateNodeTableInfo>(extraInfo.pKName,
         std::move(propertyDefinitions), std::move(storage), std::move(storageFormat),
@@ -403,6 +454,8 @@ BoundCreateTableInfo Binder::bindCreateRelTableGroupInfo(const CreateTableInfo* 
         validateNodeTableType(srcEntry);
         auto [dstEntry, dstDbName] = bindNodeTableEntry(dstTableName);
         validateNodeTableType(dstEntry);
+        validateDailyRangeRelEndpoint(srcEntry);
+        validateDailyRangeRelEndpoint(dstEntry);
 
         // For foreign-backed rel tables, validate that FROM and TO are foreign tables
         if (scanFunction.has_value()) {
@@ -565,6 +618,142 @@ std::unique_ptr<BoundStatement> Binder::bindCreateIndex(const Statement& stateme
         tableEntry->getColumnID(property.getName()), property.getType().getPhysicalType(),
         isPrimaryIndex, info.onConflict};
     return std::make_unique<BoundCreateIndex>(std::move(boundInfo));
+}
+
+std::string BoundCreateConstraintInfo::toString() const {
+    std::string props;
+    for (auto i = 0u; i < propertyNames.size(); i++) {
+        props += (i == 0 ? "" : ", ") + propertyNames[i];
+    }
+    return std::format("CONSTRAINT {} ON {}({})", constraintName, tableName, props);
+}
+
+std::unique_ptr<BoundStatement> Binder::bindCreateConstraint(const Statement& statement) {
+    auto& createConstraint = statement.constCast<CreateConstraint>();
+    auto& info = createConstraint.getInfo();
+    auto catalog = Catalog::Get(*clientContext);
+    auto transaction = transaction::Transaction::Get(*clientContext);
+    validateTableExistence(*clientContext, info.tableName);
+    auto tableEntry = catalog->getTableCatalogEntry(transaction, info.tableName);
+    if (tableEntry->getType() != CatalogEntryType::NODE_TABLE_ENTRY &&
+        tableEntry->getType() != CatalogEntryType::REL_GROUP_ENTRY) {
+        throw BinderException("CREATE CONSTRAINT is only supported on native node and rel tables.");
+    }
+    // Immutable columnar formats manage their own storage layout; scan-based enforcement
+    // does not cover them. BWD-only rel storage is rejected too: the engine cannot
+    // address it through the directional table data used by the scans.
+    if (tableEntry->getTableType() == common::TableType::REL) {
+        auto directions = tableEntry->ptrCast<RelGroupCatalogEntry>()->getRelDataDirections();
+        if (std::find(directions.begin(), directions.end(), common::RelDataDirection::FWD) ==
+            directions.end()) {
+            throw BinderException("CREATE CONSTRAINT is not supported on rel tables without "
+                                  "forward storage direction.");
+        }
+    }
+    if (tableEntry->getTableType() == common::TableType::NODE) {
+        if (tableEntry->ptrCast<NodeTableCatalogEntry>()->getStorageFormat() !=
+            common::StorageFormat::NONE) {
+            throw BinderException("CREATE CONSTRAINT is only supported on native tables.");
+        }
+    } else {
+        if (tableEntry->ptrCast<RelGroupCatalogEntry>()->getStorageFormat() !=
+            common::StorageFormat::NONE) {
+            throw BinderException("CREATE CONSTRAINT is only supported on native tables.");
+        }
+    }
+    // Writes to a partitioned parent route to its partition subgraphs, so a constraint
+    // bound to the parent (or to an individual child) would silently enforce nothing.
+    if (tableEntry->getType() == CatalogEntryType::NODE_TABLE_ENTRY) {
+        auto* nodeEntry = tableEntry->ptrCast<NodeTableCatalogEntry>();
+        if (nodeEntry->isPartitioned() || nodeEntry->isPartitionChild()) {
+            throw BinderException("CREATE CONSTRAINT is not supported on partitioned node "
+                                  "tables yet. Create the constraint on a non-partitioned "
+                                  "table instead.");
+        }
+    }
+    const auto isRelTable = tableEntry->getType() == CatalogEntryType::REL_GROUP_ENTRY;
+    if (info.isRelConstraint != isRelTable) {
+        throw BinderException(std::format("CREATE CONSTRAINT on {} must use a {} pattern.",
+            info.tableName, isRelTable ? "relationship" : "node"));
+    }
+    if (info.onConflict == ConflictAction::ON_CONFLICT_THROW &&
+        catalog->containsConstraint(transaction, info.constraintName)) {
+        throw BinderException(std::format("Constraint {} already exists.", info.constraintName));
+    }
+    // Endpoint references (src/dst) are only meaningful on rel patterns. They resolve to
+    // the edge's endpoints unless the table defines a real property with that name, in
+    // which case the property wins and the endpoint is not referenceable.
+    auto resolveEndpoint = [&](const std::string& propertyName,
+                               std::optional<common::property_id_t>& endpointID) -> bool {
+        if (!info.isRelConstraint) {
+            return false;
+        }
+        if (common::StringUtils::caseInsensitiveEquals(propertyName, "src")) {
+            endpointID = ConstraintCatalogEntry::SRC_ENDPOINT_ID;
+        } else if (common::StringUtils::caseInsensitiveEquals(propertyName, "dst")) {
+            endpointID = ConstraintCatalogEntry::DST_ENDPOINT_ID;
+        } else {
+            return false;
+        }
+        return !tableEntry->containsProperty(propertyName);
+    };
+    std::vector<common::property_id_t> propertyIDs;
+    case_insensitve_set_t seenProperties;
+    for (auto& propertyName : info.propertyNames) {
+        std::optional<common::property_id_t> endpointID;
+        if (resolveEndpoint(propertyName, endpointID)) {
+            if (!seenProperties.insert("\x00endpoint:" + propertyName).second) {
+                throw BinderException(
+                    std::format("Duplicated property {} in CREATE CONSTRAINT.", propertyName));
+            }
+            propertyIDs.push_back(*endpointID);
+            continue;
+        }
+        validateColumnExistence(tableEntry, propertyName);
+        if (!seenProperties.insert(propertyName).second) {
+            throw BinderException(
+                std::format("Duplicated property {} in CREATE CONSTRAINT.", propertyName));
+        }
+        propertyIDs.push_back(tableEntry->getPropertyID(propertyName));
+    }
+    BoundCreateConstraintInfo boundInfo{info.constraintName, info.tableName,
+        tableEntry->getTableID(), info.isRelConstraint, info.propertyNames, std::move(propertyIDs),
+        info.onConflict};
+    return std::make_unique<BoundCreateConstraint>(std::move(boundInfo));
+}
+
+std::unique_ptr<BoundStatement> Binder::bindDropConstraint(const Statement& statement) {
+    auto& dropConstraint = statement.constCast<DropConstraint>();
+    auto& info = dropConstraint.getInfo();
+    if (info.onConflict == ConflictAction::ON_CONFLICT_THROW) {
+        auto catalog = Catalog::Get(*clientContext);
+        auto transaction = transaction::Transaction::Get(*clientContext);
+        if (!catalog->containsConstraint(transaction, info.constraintName)) {
+            throw BinderException(
+                std::format("Constraint {} does not exist.", info.constraintName));
+        }
+    }
+    return std::make_unique<BoundDropConstraint>(
+        BoundDropConstraintInfo{info.constraintName, info.onConflict});
+}
+
+std::unique_ptr<BoundStatement> Binder::bindShowConstraints(const Statement& /*statement*/) {
+    ParsedFunctionExpression funcExpr(std::string{function::ShowConstraintsFunction::name},
+        false /* isDistinct */);
+    auto boundTableFunction =
+        bindTableFunc(funcExpr.getFunctionName(), funcExpr, {} /* yieldVariables */);
+    // A bare SHOW CONSTRAINTS has no RETURN clause, so expose the table function's output
+    // columns as the statement result (like CALL ... RETURN * would).
+    auto result = std::make_unique<BoundStandaloneCallFunction>(std::move(boundTableFunction));
+    auto statementResult = result->getStatementResultUnsafe();
+    for (auto& column : result->getBindData()->columns) {
+        auto name = column->getAlias();
+        if (name.empty()) {
+            name = column->toString();
+        }
+        statementResult->addColumn(name, column);
+    }
+    return result;
 }
 
 std::unique_ptr<BoundStatement> Binder::bindCreateTableAs(const Statement& statement) {
@@ -818,12 +1007,47 @@ std::unique_ptr<BoundStatement> Binder::bindRenameTable(const Statement& stateme
     return std::make_unique<BoundAlter>(std::move(boundInfo));
 }
 
+// An endpoint key part (src/dst) is stored by REQUIRE name and resolved at bind time, with
+// a real property of the same name winning. If the table later gains such a property via
+// ADD or RENAME ... TO, the next bind (e.g. on IMPORT DATABASE, which replays the
+// exported r.src spelling) would silently switch the constraint from the endpoint to the
+// property. Keep the names unambiguous by rejecting those schema changes while an
+// endpoint constraint exists on the table.
+static void validateNoEndpointNameConflict(const main::ClientContext* clientContext,
+    const std::string& tableName, const std::string& propertyName) {
+    if (!common::StringUtils::caseInsensitiveEquals(propertyName, "src") &&
+        !common::StringUtils::caseInsensitiveEquals(propertyName, "dst")) {
+        return;
+    }
+    auto* catalog = Catalog::Get(*clientContext);
+    auto* transaction = transaction::Transaction::Get(*clientContext);
+    if (!catalog->containsTable(transaction, tableName)) {
+        return;
+    }
+    auto* tableEntry = catalog->getTableCatalogEntry(transaction, tableName);
+    if (tableEntry->getType() != CatalogEntryType::REL_GROUP_ENTRY) {
+        return;
+    }
+    for (auto* constraint : catalog->getConstraintEntries(transaction, tableEntry->getTableID())) {
+        for (auto propertyID : constraint->getPropertyIDs()) {
+            if (ConstraintCatalogEntry::isEndpointPropertyID(propertyID)) {
+                throw BinderException(std::format(
+                    "Cannot add or rename a property to {} in table {} because it conflicts "
+                    "with the {} endpoint of unique constraint {}. Drop the constraint first "
+                    "or choose a different name.",
+                    propertyName, tableName, propertyName, constraint->getConstraintName()));
+            }
+        }
+    }
+}
+
 std::unique_ptr<BoundStatement> Binder::bindAddProperty(const Statement& statement) {
     auto& alter = statement.constCast<Alter>();
     auto info = alter.getInfo();
     auto extraInfo = info->extraInfo->ptrCast<ExtraAddPropertyInfo>();
     auto tableName = info->tableName;
     auto propertyName = extraInfo->propertyName;
+    validateNoEndpointNameConflict(clientContext, tableName, propertyName);
     auto type = LogicalType::convertFromString(extraInfo->dataType, clientContext);
     auto columnDefinition = ColumnDefinition(propertyName, type.copy());
     auto defaultExpr =
@@ -848,6 +1072,23 @@ std::unique_ptr<BoundStatement> Binder::bindDropProperty(const Statement& statem
     auto extraInfo = info->extraInfo->constPtrCast<ExtraDropPropertyInfo>();
     auto tableName = info->tableName;
     auto propertyName = extraInfo->propertyName;
+    auto catalog = Catalog::Get(*clientContext);
+    auto transaction = transaction::Transaction::Get(*clientContext);
+    if (catalog->containsTable(transaction, tableName)) {
+        auto* tableEntry = catalog->getTableCatalogEntry(transaction, tableName);
+        if (tableEntry->containsProperty(propertyName)) {
+            const auto propertyID = tableEntry->getPropertyID(propertyName);
+            for (auto* constraint :
+                catalog->getConstraintEntries(transaction, tableEntry->getTableID())) {
+                if (constraint->containsPropertyID(propertyID)) {
+                    throw BinderException(std::format(
+                        "Cannot drop property {} in table {} because it is used in unique "
+                        "constraint {}. Drop the constraint first.",
+                        propertyName, tableName, constraint->getConstraintName()));
+                }
+            }
+        }
+    }
     auto boundExtraInfo = std::make_unique<BoundExtraDropPropertyInfo>(propertyName);
     auto boundInfo = BoundAlterInfo(AlterType::DROP_PROPERTY, tableName, std::move(boundExtraInfo),
         info->onConflict);
@@ -861,6 +1102,7 @@ std::unique_ptr<BoundStatement> Binder::bindRenameProperty(const Statement& stat
     auto tableName = info->tableName;
     auto propertyName = extraInfo->propertyName;
     auto newName = extraInfo->newName;
+    validateNoEndpointNameConflict(clientContext, tableName, newName);
     auto boundExtraInfo = std::make_unique<BoundExtraRenamePropertyInfo>(newName, propertyName);
     auto boundInfo = BoundAlterInfo(AlterType::RENAME_PROPERTY, tableName,
         std::move(boundExtraInfo), info->onConflict);
@@ -943,6 +1185,8 @@ std::unique_ptr<BoundStatement> Binder::bindAlterFromToConnection(
     }
     auto [srcTableEntry, srcDbName] = bindNodeTableEntry(extraInfo->srcTableName);
     auto [dstTableEntry, dstDbName] = bindNodeTableEntry(extraInfo->dstTableName);
+    validateDailyRangeRelEndpoint(srcTableEntry);
+    validateDailyRangeRelEndpoint(dstTableEntry);
     auto srcTableID = srcTableEntry->getTableID();
     auto dstTableID = dstTableEntry->getTableID();
     auto boundExtraInfo = std::make_unique<BoundExtraAlterFromToConnection>(srcTableID, dstTableID);

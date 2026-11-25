@@ -42,6 +42,19 @@ checkpoint was rolled back, the changes are lost on restart unless a later `CHEC
 if it made the database refuse writes, they survive the restart only if the checkpoint's record
 reached storage.
 
+When an automatic checkpoint is due and another writer is active or entering, the committing
+thread normally returns immediately. On a subsequent eligible commit, it closes the write gate
+and waits for active writers if the first deferral was at least 30 seconds ago. WAL growth can
+trigger the same wait sooner, including on the first eligible commit. The initial size limit is
+`checkpoint_threshold` plus the larger of `checkpoint_threshold` and 1 MiB, or 32 MiB with
+the default settings. After a timeout or a checkpoint that retains the WAL for a reader, the next
+size-triggered wait allows another `max(checkpoint_threshold, 1 MiB)` bytes of growth.
+
+The first deferral is logged to standard error. A fallback logs the number of deferrals, elapsed
+time and active WAL size. If the writers drain sooner, the next successful checkpoint logs how
+many times it was deferred. A drain timeout leaves the commit durable and allows later commits
+to retry.
+
 ## Pinned checkpoints
 
 A checkpoint taken while a read-only transaction is open keeps the WAL that transaction may still
@@ -84,6 +97,18 @@ A graph WAL alongside a shadow under such a marker is treated as applied and ret
 replaying, so a standalone write made after that checkpoint would be dropped in that window;
 upgrading and checkpointing again clears the window. When transactions follow the last `CHECKPOINT`,
 a graph WAL replays regardless of the marker, as in older builds.
+
+## Failed commits
+
+A transaction whose changes cannot be applied after its `COMMIT` record is durable, for example
+because the buffer pool is full, is rolled back in memory and gets an `ABORT` record naming the WAL
+offset where its records start. Recovery skips the transactions such records name, so a `COMMIT`
+that reported an error is not applied once its `ABORT` is durable. If the `ABORT` record cannot be
+written either, the database refuses further writes until it is reopened, and recovery then
+applies the transaction. The `ABORT` always lands in the WAL file of its `COMMIT` with no
+`CHECKPOINT` record between them, since a checkpoint waits for the failed transaction's rollback;
+recovery ignores an `ABORT` that names no transaction committed in its file after the last
+`CHECKPOINT` before it.
 
 ## Checkpoint bundle format
 
@@ -151,10 +176,12 @@ An ordinary version 2 WAL tail — owner trailers on the records but no pending 
 quieter hazard: an older build does not reliably refuse it. A record type the older build knows
 decodes with the trailer skipped as unknown trailing bytes and replays against the main catalog,
 silently misapplying records meant for a graph. A record type the older build does not know, such
-as `UPDATE_SEQUENCE_NAMED`, is no safer: with the default non-throwing replay configuration the
-decoding error is treated like a corrupt WAL tail — the older build replays the committed prefix
-and truncates the WAL there, silently discarding that transaction and every transaction recorded
-after it. Setting `throwOnWalReplayFailure` to true rejects an unknown record before that WAL
+as `UPDATE_SEQUENCE_NAMED` or `ABORT`, is no safer: with the default non-throwing replay
+configuration the decoding error is treated like a corrupt WAL tail — the older build replays the
+committed prefix and truncates the WAL there, silently discarding that transaction and every
+transaction recorded after it. For `ABORT`, which marks a transaction that failed after its
+`COMMIT` record was written, the older build also applies the transaction it undoes. Setting
+`throwOnWalReplayFailure` to true rejects an unknown record before that WAL
 is applied, but it still does not make downgrading safe: a WAL containing only recognized
 record types passes validation, and its owner trailers are ignored. This is why the successful
 `CHECKPOINT`, not a clean close, is the downgrade gate.

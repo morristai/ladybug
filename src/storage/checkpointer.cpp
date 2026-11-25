@@ -393,11 +393,13 @@ void Checkpointer::postCheckpointCleanup(bool canResetPageManagerToCurrent) try 
         }
         target.storageManager->finalizeCheckpoint(clientContext);
     }
-    // Finalize partition children's page managers: their allocations were committed when the
-    // main header was written and their shadow pages applied.
+    // Finalize partition children: their allocations were committed when the main header was
+    // written and their shadow pages applied. This also publishes the staged state of children
+    // whose shadow pages were not applied above (no shadow file); for the others it is already
+    // published.
     if (auto* dbManager = main::DatabaseManager::Get(clientContext)) {
         for (auto* sm : dbManager->getPartitionStorageRegistry()->getAllManagers()) {
-            sm->getDataFH()->getPageManager()->finalizeCheckpoint();
+            sm->finalizeCheckpoint(clientContext);
         }
     }
     auto bufferManager = MemoryManager::Get(clientContext)->getBufferManager();
@@ -583,7 +585,7 @@ void Checkpointer::logCheckpointAndApplyShadowPages(bool walRotated_) {
     } else {
         wal.logAndFlushCheckpoint(&clientContext);
     }
-    shadowFile.applyShadowPages(*mainStorageManager, clientContext);
+    mainStorageManager->applyShadowPagesAndPublish(clientContext);
     applyShadowPagesForPartitionChildren();
 }
 
@@ -600,8 +602,7 @@ void Checkpointer::applyGraphShadowPages() {
     for (const auto& target : checkpointTargets) {
         if (target.storageManager != mainStorageManager) {
             beforeGraphShadowApply(*target.storageManager);
-            target.storageManager->getShadowFile().applyShadowPages(*target.storageManager,
-                clientContext);
+            target.storageManager->applyShadowPagesAndPublish(clientContext);
         }
     }
 }
@@ -621,7 +622,9 @@ void Checkpointer::applyShadowPagesForPartitionChildren() {
         if (!shadowFile.hasShadowingFH()) {
             continue;
         }
-        shadowFile.applyShadowPages(*sm, clientContext);
+        // Publish the child's staged primary-key index state together with its pages, as for
+        // the main database (#1052).
+        sm->applyShadowPagesAndPublish(clientContext);
         sm->getDataFH()->flushAllDirtyPagesInFrames();
     }
 }
@@ -629,6 +632,16 @@ void Checkpointer::applyShadowPagesForPartitionChildren() {
 void Checkpointer::rollback() try {
     if (isInMemory) {
         return;
+    }
+    // A failed savepoint restore can leave a failed node group's bytes in a shadow page that
+    // completed groups also own (see ShadowFile::recordSavepointRollbackFailure). Partition
+    // children are not checkpoint targets; their shadow files are cleared below.
+    std::string savepointRollbackFailures;
+    for (const auto& target : checkpointTargets) {
+        if (const auto& failure =
+                target.storageManager->getShadowFile().getSavepointRollbackFailure()) {
+            savepointRollbackFailures += (savepointRollbackFailures.empty() ? "" : "; ") + *failure;
+        }
     }
     beforeRollback();
     // Any pages freed during the checkpoint are no longer freed
@@ -653,6 +666,12 @@ void Checkpointer::rollback() try {
         if (rotated) {
             storageManager->getWAL().undoRotationForCheckpoint();
         }
+    }
+    if (!savepointRollbackFailures.empty()) {
+        // Poisoned by the handler below: a retried checkpoint would apply those pages.
+        throw common::RuntimeException(std::format(
+            "a node group could not restore its shadow pages after a failed checkpoint: {}",
+            savepointRollbackFailures));
     }
     releaseCheckpointLocks();
 } catch (const std::exception& e) {

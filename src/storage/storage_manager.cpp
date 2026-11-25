@@ -132,6 +132,32 @@ bool StorageManager::containsTable(table_id_t tableID) const {
     return tables.contains(tableID);
 }
 
+NodeTable* StorageManager::tryGetNativeNodeTable(const main::ClientContext& context,
+    const catalog::TableCatalogEntry& entry) {
+    if (entry.getType() != catalog::CatalogEntryType::NODE_TABLE_ENTRY) {
+        return nullptr;
+    }
+    const auto tableID = entry.getTableID();
+    auto transaction = transaction::Transaction::Get(context);
+    auto catalog = catalog::Catalog::Get(context);
+    if (!catalog->containsTable(transaction, tableID) ||
+        catalog->getTableCatalogEntry(transaction, tableID) != &entry) {
+        return nullptr;
+    }
+    auto& nodeEntry = entry.constCast<catalog::NodeTableCatalogEntry>();
+    if (nodeEntry.isPartitioned() || nodeEntry.isPartitionChild() ||
+        nodeEntry.getScanFunction().has_value() || nodeEntry.getReferencedEntry() != nullptr ||
+        !nodeEntry.getForeignDatabaseName().empty() || !nodeEntry.getStorage().empty() ||
+        nodeEntry.getStorageFormat() != StorageFormat::NONE) {
+        return nullptr;
+    }
+    auto storageManager = Get(context);
+    if (!storageManager->containsTable(tableID)) {
+        return nullptr;
+    }
+    return dynamic_cast<NodeTable*>(storageManager->getTable(tableID));
+}
+
 std::optional<PlannerTableStats> StorageManager::getCachedPlannerTableStats(
     table_id_t tableID) const {
     std::shared_lock lck{plannerStatsMtx};
@@ -556,11 +582,42 @@ std::unordered_map<table_id_t, uint64_t> StorageManager::captureChangeEpochs() c
     return epochs;
 }
 
+bool StorageManager::vacuumInMemoryUpdates(transaction_t horizon) {
+    std::shared_lock lck{mtx};
+    bool didWork = false;
+    for (const auto& [id, table] : tables) {
+        if (table->vacuumInMemoryUpdates(horizon)) {
+            didWork = true;
+        }
+    }
+    return didWork;
+}
+
+void StorageManager::applyShadowPagesAndPublish(main::ClientContext& context) {
+    // Collect the tables first so applyMtx (held while publishing) never nests inside mtx.
+    std::vector<Table*> tablesToPublish;
+    {
+        std::shared_lock lck{mtx};
+        tablesToPublish.reserve(tables.size());
+        for (auto& [id, table] : tables) {
+            tablesToPublish.push_back(table.get());
+        }
+    }
+    // Publishing at finalizeCheckpoint() instead would leave a window in which readers resolve
+    // primary keys through the old index headers over the new slot pages (#1052).
+    shadowFile->applyShadowPages(*this, context, [&]() {
+        for (auto* table : tablesToPublish) {
+            table->finalizeCheckpoint(context);
+        }
+    });
+}
+
 void StorageManager::finalizeCheckpoint(main::ClientContext& context) {
     dataFH->getPageManager()->finalizeCheckpoint();
     // Publish staged per-table state (e.g. PK index read headers) now that the checkpoint
     // committed. Must run post-commit: publishing earlier would expose half-checkpointed
-    // state to a rollback that cannot restore it.
+    // state to a rollback that cannot restore it. Storage managers whose shadow pages went
+    // through applyShadowPagesAndPublish() have already published, so this is a no-op for them.
     std::unique_lock lck{mtx};
     for (auto& [id, table] : tables) {
         table->finalizeCheckpoint(context);
@@ -569,6 +626,14 @@ void StorageManager::finalizeCheckpoint(main::ClientContext& context) {
 
 void StorageManager::rollbackCheckpoint(const Catalog& catalog, main::ClientContext* context) {
     std::unique_lock lck{mtx};
+    // Only node tables are partitioned, so every rel table is in this storage manager's tables.
+    for (const auto entry : catalog.getRelGroupEntries(&DUMMY_CHECKPOINT_TRANSACTION)) {
+        for (auto& info : entry->getRelEntryInfos()) {
+            if (tables.contains(info.oid)) {
+                tables.at(info.oid)->rollbackCheckpoint();
+            }
+        }
+    }
     const auto nodeTableEntries = catalog.getNodeTableEntries(&DUMMY_CHECKPOINT_TRANSACTION);
     for (const auto tableEntry : nodeTableEntries) {
         // Partitioned parents hold no physical storage; only their partition subgraphs do.

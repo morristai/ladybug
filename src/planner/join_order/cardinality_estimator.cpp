@@ -82,7 +82,8 @@ void CardinalityEstimator::init(const NodeExpression& node) {
         // partition substitutes) - they don't have storage in the local database.
         if (entry->getType() == catalog::CatalogEntryType::FOREIGN_TABLE_ENTRY ||
             (entry->getType() == catalog::CatalogEntryType::NODE_TABLE_ENTRY &&
-                entry->ptrCast<catalog::NodeTableCatalogEntry>()->getScanFunction().has_value())) {
+                (entry->ptrCast<catalog::NodeTableCatalogEntry>()->isPartitioned() ||
+                    entry->getScanFunction().has_value()))) {
             continue;
         }
         auto tableID = entry->getTableID();
@@ -435,7 +436,7 @@ static bool isCast(const Expression& expr) {
     if (expr.expressionType != ExpressionType::FUNCTION || expr.getNumChildren() != 1) {
         return false;
     }
-    return expr.constCast<ScalarFunctionExpression>().getFunction().name.starts_with("CAST");
+    return expr.constCast<ScalarFunctionExpression>().isCast();
 }
 
 // Strips every one-argument function named CAST* to the underlying property, so a

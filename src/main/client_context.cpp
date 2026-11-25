@@ -9,6 +9,7 @@
 #include "common/exception/connection.h"
 #include "common/exception/runtime.h"
 #include "common/file_system/virtual_file_system.h"
+#include "common/path_utils.h"
 #include "common/random_engine.h"
 #include "common/string_utils.h"
 #include "common/task_system/progress_bar.h"
@@ -72,7 +73,8 @@ ActiveQuery::ActiveQuery() : interrupted{false} {}
 void ActiveQuery::reset() {
     interrupted = false;
     queryID.reset();
-    timer = Timer();
+    // The timer keeps its start time until startTimer() restarts it: a thread waiting on a task
+    // reads it, and a zeroed start would look like a long-expired deadline.
 }
 
 ClientContext::ClientContext(Database* database) : localDatabase{database} {
@@ -250,7 +252,7 @@ void ClientContext::addDBDirToFileSearchPath(const std::string& dbPath) {
     if (dirPath.empty()) {
         dirPath = expandedPath[slashPos] == '\\' ? "\\" : "/";
     } else {
-        dirPath = std::filesystem::absolute(dirPath).lexically_normal().string();
+        dirPath = PathUtils::absoluteLexicallyNormalUTF8(dirPath);
     }
     // Prepend to fileSearchPath if not already present
     auto& fileSearchPath = clientConfig.fileSearchPath;
@@ -416,7 +418,9 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
     const bool planStale =
         cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion() ||
         cachedStatement->hasUncommittedCatalogChanges ||
-        (activeTransaction != nullptr && activeTransaction->hasCatalogChanges()) ||
+        (activeTransaction != nullptr &&
+            (activeTransaction->hasCatalogChanges() ||
+                cachedStatement->planVersion != activeTransaction->getCatalogPlanVersion())) ||
         cachedStatement->boundWithExternalAccessDisabled != clientConfig.disableExternalAccess;
     // Statements with parameters baked into a plan (e.g. parameter-valued SKIP/LIMIT
     // frozen to uint64_t) must rebind/replan on every execution instead of reusing any
@@ -623,6 +627,11 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
                 cachedStatement->hasBakedParameters =
                     hasBakedParameters(cachedStatement->boundParameters);
                 auto* activeTransaction = transactionContext->getActiveTransaction();
+                // A concurrent DDL commit can advance the global version while this snapshot
+                // still binds to its old schema (including its old set of partitions).
+                cachedStatement->planVersion = activeTransaction ?
+                                                   activeTransaction->getCatalogPlanVersion() :
+                                                   localDatabase->getCatalog()->getPlanVersion();
                 cachedStatement->hasUncommittedCatalogChanges =
                     activeTransaction != nullptr && activeTransaction->hasCatalogChanges();
             },
@@ -634,7 +643,6 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
         preparedStatement->success = false;
         preparedStatement->errMsg = exception.what();
     }
-    cachedStatement->planVersion = localDatabase->getCatalog()->getPlanVersion();
     cachedStatement->boundWithExternalAccessDisabled = clientConfig.disableExternalAccess;
     prepareTimer.stop();
     preparedStatement->preparedSummary.compilingTime =

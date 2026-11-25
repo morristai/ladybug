@@ -30,3 +30,47 @@
            RETURN COUNT(*);
 ---- 1
 5000
+
+# A predicate that calls nextval() must filter groups, not input rows: below the aggregate it runs
+# once per scan batch and the counts cover only the batch that passes. One thread keeps both groups
+# in one output batch, so nextval runs once.
+-CASE GroupKeyPredicateWithNextvalStaysAboveAggregate
+-SKIP_VECTOR_CAPACITY_TESTS
+-STATEMENT CREATE NODE TABLE P(id INT64, g INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(0, 9999) AS i CREATE (:P {id: i, g: i % 2});
+---- ok
+-STATEMENT CREATE SEQUENCE s;
+---- ok
+-STATEMENT CALL threads=1;
+---- ok
+-STATEMENT MATCH (p:P) WITH p.g AS g, count(*) AS c WHERE nextval('s') = 1 RETURN g, c;
+---- 2
+0|5000
+1|5000
+-STATEMENT RETURN currval('s');
+---- 1
+1
+
+# No conjunct moves below the aggregate when one is volatile. Otherwise currval would run on input
+# rows before the nextval conjunct kept above, and kept conjuncts that became separate filters
+# could run in a different order.
+-CASE GroupKeyPredicateWithVolatileConjunctStaysAboveAggregate
+-SKIP_VECTOR_CAPACITY_TESTS
+-STATEMENT CREATE NODE TABLE P(id INT64, g INT64, seq STRING, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(0, 9999) AS i CREATE (:P {id: i, g: i % 2, seq: 's'});
+---- ok
+-STATEMENT CREATE SEQUENCE s;
+---- ok
+-STATEMENT CALL threads=1;
+---- ok
+-STATEMENT MATCH (p:P) WITH p.seq AS seq, count(*) AS c WHERE seq = 's' AND nextval(seq) > 0 AND currval(seq) > 0 RETURN seq, c;
+---- 1
+s|10000
+-STATEMENT RETURN currval('s');
+---- 1
+1
+-STATEMENT MATCH (p:P) WITH p.g AS g, count(*) AS c WHERE setval('s', 10) > 0 AND nextval('s') = 11 AND g = 1 RETURN g, c;
+---- 1
+1|5000
