@@ -3,11 +3,13 @@
 #include <string_view>
 #include <vector>
 
+#include "common/data_chunk/data_chunk_state.h"
 #include "common/vector/value_vector.h"
 #include "graph_test/private_graph_test.h"
 #include "gtest/gtest.h"
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/table/dictionary_chunk.h"
+#include "storage/table/in_mem_chunked_node_group_collection.h"
 #include "storage/table/string_chunk_data.h"
 
 using namespace lbug::common;
@@ -137,6 +139,39 @@ TEST_F(StringDictionaryCopyTest, OverwritingRowsStillPrunesTheDictionary) {
     resetChunk.finalize();
     EXPECT_EQ(dictionarySize(resetChunk.getDictionaryChunk()), 1u);
     EXPECT_EQ(resetChunk.getValue<std::string>(1), "kept");
+}
+
+// The partitions of a rel COPY buffer every row in both directions until the node groups are
+// written, so a repeated string (customer ID, relation name) must be stored once per chunk.
+TEST_F(StringDictionaryCopyTest, CopyPartitionChunksDeduplicateStrings) {
+    auto* mm = getMemoryManager(*database);
+    std::vector<LogicalType> types;
+    types.push_back(LogicalType::STRING());
+    types.push_back(LogicalType::STRING());
+    InMemChunkedNodeGroupCollection collection{std::move(types)};
+    auto state = std::make_shared<DataChunkState>(DEFAULT_VECTOR_CAPACITY);
+    state->getSelVectorUnsafe().setSelSize(DEFAULT_VECTOR_CAPACITY);
+    ValueVector customer{LogicalType::STRING(), mm};
+    ValueVector relationship{LogicalType::STRING(), mm};
+    customer.setState(state);
+    relationship.setState(state);
+    for (auto i = 0u; i < DEFAULT_VECTOR_CAPACITY; i++) {
+        StringVector::addString(&customer, i, "9011075d-a2d7-4ff0-8660-47645735d0e7");
+        StringVector::addString(&relationship, i, "relationship-" + std::to_string(i));
+    }
+    collection.append(*mm, {&customer, &relationship}, 0, DEFAULT_VECTOR_CAPACITY);
+
+    ASSERT_GE(collection.getNumChunkedGroups(), 1u);
+    auto& group = collection.getChunkedGroup(0);
+    ASSERT_EQ(group.getNumRows(), DEFAULT_VECTOR_CAPACITY);
+    const auto& customerChunk = group.getColumnChunk(0).cast<StringChunkData>();
+    const auto& relationshipChunk = group.getColumnChunk(1).cast<StringChunkData>();
+    EXPECT_EQ(dictionarySize(customerChunk.getDictionaryChunk()), 1u);
+    EXPECT_EQ(dictionarySize(relationshipChunk.getDictionaryChunk()), DEFAULT_VECTOR_CAPACITY);
+    for (auto i = 0u; i < DEFAULT_VECTOR_CAPACITY; i++) {
+        EXPECT_EQ(customerChunk.getValue<std::string>(i), "9011075d-a2d7-4ff0-8660-47645735d0e7");
+        EXPECT_EQ(relationshipChunk.getValue<std::string>(i), "relationship-" + std::to_string(i));
+    }
 }
 
 } // namespace

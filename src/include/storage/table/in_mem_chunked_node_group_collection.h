@@ -47,6 +47,8 @@ public:
     }
 
 private:
+    std::unique_ptr<InMemChunkedNodeGroup> newChunkedGroup(MemoryManager& memoryManager) const;
+
     std::vector<common::LogicalType> types;
     std::vector<std::unique_ptr<InMemChunkedNodeGroup>> chunkedGroups;
 };

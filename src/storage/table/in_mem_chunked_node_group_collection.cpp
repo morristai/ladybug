@@ -8,13 +8,21 @@ using namespace lbug::transaction;
 namespace lbug {
 namespace storage {
 
+std::unique_ptr<InMemChunkedNodeGroup> InMemChunkedNodeGroupCollection::newChunkedGroup(
+    MemoryManager& memoryManager) const {
+    // Compression only takes effect when a chunk is flushed, which these never are; enabling it
+    // de-duplicates string dictionaries. Without it a rel COPY buffered every row's copy of
+    // low-cardinality strings (customer IDs, relation names) in both directions, which made up
+    // most of its peak memory.
+    return std::make_unique<InMemChunkedNodeGroup>(memoryManager, types, true /*enableCompression*/,
+        common::StorageConfig::CHUNKED_NODE_GROUP_CAPACITY, 0 /*startRowIdx*/);
+}
+
 void InMemChunkedNodeGroupCollection::append(MemoryManager& memoryManager,
     const std::vector<ValueVector*>& vectors, row_idx_t startRowInVectors,
     row_idx_t numRowsToAppend) {
     if (chunkedGroups.empty()) {
-        chunkedGroups.push_back(std::make_unique<InMemChunkedNodeGroup>(memoryManager, types,
-            false /*enableCompression*/, common::StorageConfig::CHUNKED_NODE_GROUP_CAPACITY,
-            0 /*startOffset*/));
+        chunkedGroups.push_back(newChunkedGroup(memoryManager));
     }
     row_idx_t numRowsAppended = 0;
     while (numRowsAppended < numRowsToAppend) {
@@ -24,9 +32,7 @@ void InMemChunkedNodeGroupCollection::append(MemoryManager& memoryManager,
         lastChunkedGroup->append(vectors, startRowInVectors, numRowsToAppendInGroup);
         if (lastChunkedGroup->getNumRows() == common::StorageConfig::CHUNKED_NODE_GROUP_CAPACITY) {
             lastChunkedGroup->setUnused(memoryManager);
-            chunkedGroups.push_back(std::make_unique<InMemChunkedNodeGroup>(memoryManager, types,
-                false /*enableCompression*/, common::StorageConfig::CHUNKED_NODE_GROUP_CAPACITY,
-                0 /* startRowIdx */));
+            chunkedGroups.push_back(newChunkedGroup(memoryManager));
         }
         numRowsAppended += numRowsToAppendInGroup;
     }
